@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ヘルプ応募</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; text-align: center; }
+  .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 400px; margin: 40px auto; }
+  h2 { margin-top: 0; }
+  .detail { text-align: left; background: #f8f9fb; padding: 14px; border-radius: 8px; margin: 16px 0; font-size: 14px; line-height: 1.7; }
+  input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; margin-top: 6px; font-family: inherit; }
+  button { background: #27ae60; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
+  button:disabled { background: #ccc; }
+  .result { margin-top: 16px; font-size: 15px; font-weight: bold; }
+  .filled { color: #e74c3c; }
+  .ok { color: #27ae60; }
+</style>
+</head>
+<body>
+<div class="card" id="card">読み込み中...</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const shiftId = params.get('id');
+const card = document.getElementById('card');
+
+async function init() {
+  if (!shiftId) {
+    card.innerHTML = '<p>不正なURLです。</p>';
+    return;
+  }
+  const res = await fetch('/api/shift/' + shiftId);
+  const shift = await res.json();
+  if (!res.ok) {
+    card.innerHTML = `<p>${shift.error || '募集が見つかりません'}</p>`;
+    return;
+  }
+  render(shift);
+}
+
+function render(shift) {
+  if (shift.status === 'filled') {
+    card.innerHTML = `
+      <h2>🙏 募集終了</h2>
+      <div class="detail">
+        <strong>${escapeHtml(shift.store_name)}</strong><br>
+        ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
+      </div>
+      <p class="result filled">すでに他のスタッフが対応済みです。ご確認ありがとうございました！</p>
+    `;
+    return;
+  }
+  card.innerHTML = `
+    <h2>🚨 急募のヘルプ</h2>
+    <div class="detail">
+      <strong>${escapeHtml(shift.store_name)}</strong><br>
+      ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
+      ${shift.note ? '<br>' + escapeHtml(shift.note) : ''}
+    </div>
+    <label style="font-size:13px;color:#555;">お名前</label>
+    <input id="name" placeholder="例：山田">
+    <button id="respondBtn" onclick="respond()">✋ このヘルプに入る</button>
+    <div id="result" class="result"></div>
+  `;
+}
+
+async function respond() {
+  const btn = document.getElementById('respondBtn');
+  const resultEl = document.getElementById('result');
+  const name = document.getElementById('name').value.trim();
+  btn.disabled = true;
+  resultEl.textContent = '送信中...';
+
+  try {
+    const res = await fetch(`/api/shift/${shiftId}/respond`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (res.status === 409) {
+      resultEl.textContent = '😢 ' + data.error;
+      resultEl.className = 'result filled';
+      return;
+    }
+    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
+    resultEl.textContent = '✅ ' + data.message;
+    resultEl.className = 'result ok';
+  } catch (err) {
+    resultEl.textContent = '❌ ' + err.message;
+    btn.disabled = false;
+  }
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+init();
+</script>
+</body>
+</html>
