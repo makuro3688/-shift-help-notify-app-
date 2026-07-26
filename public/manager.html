@@ -1,7 +1,7 @@
 <!DOCTYPE html>
-<!-- saved from url=(0082)file:///C:/Users/user/Documents/GitHub/-shift-help-notify-app-/public/manager.html -->
-<html lang="ja"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>店長用ダッシュボード</title>
 <style>
@@ -25,7 +25,8 @@
 <div class="card">
   <h2>🚨 急募を配信</h2>
   <label>店舗名</label>
-  <input id="store_name" placeholder="例：〇〇店">
+  <input id="store_name" placeholder="例：〇〇店" list="storeNameHistory" autocomplete="off">
+  <datalist id="storeNameHistory"></datalist>
   <label>日付</label>
   <input id="date" type="date">
   <label>時間</label>
@@ -38,7 +39,7 @@
 
 <div class="card">
   <h2>募集状況 <span class="refresh" onclick="loadShifts()">🔄更新</span></h2>
-  <div id="shiftList">❌ Failed to fetch</div>
+  <div id="shiftList">読み込み中...</div>
 </div>
 
 <script>
@@ -93,6 +94,10 @@ async function loadShifts() {
     const res = await fetch('/api/shifts', { headers: { 'x-admin-key': getAdminKey() } });
     const shifts = await res.json();
     if (!res.ok) throw new Error(shifts.error || '取得に失敗しました');
+
+    // 過去に配信した店舗名をタッチ候補（datalist）として表示する
+    updateStoreNameHistory(shifts);
+
     if (!shifts.length) {
       listEl.textContent = 'まだ募集はありません。';
       return;
@@ -113,12 +118,24 @@ async function loadShifts() {
   }
 }
 
+function updateStoreNameHistory(shifts) {
+  const datalist = document.getElementById('storeNameHistory');
+  const seen = new Set();
+  const names = [];
+  for (const s of shifts) {
+    if (s.store_name && !seen.has(s.store_name)) {
+      seen.add(s.store_name);
+      names.push(s.store_name);
+    }
+  }
+  datalist.innerHTML = names.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
+}
+
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 loadShifts();
 </script>
-
-
-</body></html>
+</body>
+</html>
