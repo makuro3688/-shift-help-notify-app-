@@ -1,66 +1,232 @@
-# 急な欠勤ヘルプ募集ボット
+require('dotenv').config();
+const path = require('path');
+const express = require('express');
+const cors = require('cors');
+const webpush = require('web-push');
+const { createClient } = require('@supabase/supabase-js');
 
-店長が「急な欠勤の穴埋め探し」にかけている時間をなくすための、LINEも個人情報も使わないPush通知アプリ。
+const app = express();
+const PORT = process.env.PORT || 3000;
+const ADMIN_KEY = process.env.ADMIN_KEY || 'change-me-please';
 
-## 構成
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  console.error('❌ SUPABASE_URLとSUPABASE_SERVICE_KEYを.envに設定してください（.env.example参照）。');
+  process.exit(1);
+}
 
-- `server.js` — Express + web-push のバックエンド
-- `public/index.html` — スタッフ用：通知登録画面
-- `public/manager.html` — 店長用：急募を配信＋募集状況の確認
-- `public/respond.html` — スタッフ用：通知をタップした先の応募画面（先着1名）
-- `public/sw.js` — Service Worker（プッシュ通知の受信・タップ処理）
-- `supabase/setup.sql` — Supabase（外部の無料データベース）に作成するテーブルのDDL
-- データ（スタッフの通知宛先、募集履歴、VAPID鍵）はSupabaseに保存する。Renderのサーバー自体は状態を持たない設計
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-## 元コードからの主な修正点
+function mapShift(row) {
+  return {
+    id: row.id,
+    store_name: row.store_name,
+    date: row.date,
+    time: row.time,
+    note: row.note || '',
+    status: row.status,
+    filledBy: row.filled_by,
+    filledAt: row.filled_at,
+    createdAt: row.created_at,
+  };
+}
 
-1. **データの永続化先をSupabase（外部DB）にした。** 元のコードはメモリ上の配列に保存しており、サーバー再起動のたびに全登録が消えるバグがあった。Render無料プランはローカルディスクも一時的なため、ファイル保存ではなく外部DBに保存する構成にした。
-2. **VAPID鍵もSupabaseに保存し使い回す。** 元のコードは起動のたびに鍵を再生成しており、再起動するだけで登録済み全スタッフの通知が届かなくなるバグがあった。
-3. **先着順の応募をDB側のUPDATE文で原子的に判定。** `UPDATE ... WHERE status = 'open'` を使うことで、複数人が同時にボタンを押しても1人しか成立しないことをPostgres側で保証している。
-4. **`index.html`内の壊れた`fetch`URL・`server.js`内の壊れた`mailto`リンクを修正。**（コピペ時にMarkdownのリンク記法が混入していた）
-5. **`sw.js`の`vibrate:,`を`vibrate: [200, 100, 200]`に修正。**（空の配列指定は構文エラーになる）
-6. **公開鍵をハードコードせず`/api/vapid-public-key`から取得するように変更。**
-7. **店長用ダッシュボード（`manager.html`）を新規作成。** 元のコードには配信ボタンを押すUIがなかった。
-8. **応募画面（`respond.html`）を新規作成。** 通知タップ先として言及はあったが実体がなかった。
-9. **店長用APIに簡易認証を追加。** `x-admin-key`ヘッダーで`.env`の`ADMIN_KEY`と照合。
+async function getConfig(key) {
+  const { data, error } = await supabase.from('app_config').select('value').eq('key', key).maybeSingle();
+  if (error) throw error;
+  return data ? data.value : null;
+}
 
-## セットアップ
+async function setConfig(key, value) {
+  const { error } = await supabase.from('app_config').upsert({ key, value });
+  if (error) throw error;
+}
 
-1. https://supabase.com でプロジェクトを作成し、SQL Editorで `supabase/setup.sql` を実行（テーブル作成）
-2. Project Settings → API から `Project URL` と `service_role` キーを控える
+async function loadOrCreateVapidKeys() {
+  const [publicKey, privateKey] = await Promise.all([getConfig('vapid_public_key'), getConfig('vapid_private_key')]);
+  if (publicKey && privateKey) return { publicKey, privateKey };
 
-```bash
-cd help-notify-app
-npm install
-cp .env.example .env
-# .envを開いて ADMIN_KEY・SUPABASE_URL・SUPABASE_SERVICE_KEY を設定する
-npm start
-```
+  const keys = webpush.generateVAPIDKeys();
+  await setConfig('vapid_public_key', keys.publicKey);
+  await setConfig('vapid_private_key', keys.privateKey);
+  console.log('🔑 新しいVAPID鍵を生成しました（Supabaseのapp_configテーブルに保存済み。以後はこれを使い回します）');
+  return keys;
+}
 
-起動時にコンソールへVAPID公開鍵が表示されるが、コピペ作業は不要（フロントが自動取得し、鍵自体もSupabaseに保存され使い回される）。
+async function main() {
+  const vapidKeys = await loadOrCreateVapidKeys();
+  webpush.setVapidDetails(
+    process.env.VAPID_CONTACT_EMAIL ? `mailto:${process.env.VAPID_CONTACT_EMAIL}` : 'mailto:example@example.com',
+    vapidKeys.publicKey,
+    vapidKeys.privateKey
+  );
 
-## ローカルでの動作確認
+  console.log('=========================================');
+  console.log('🔑 PUBLIC VAPID KEY:', vapidKeys.publicKey);
+  console.log('=========================================');
 
-1. `http://localhost:3000/` をスマホ（またはPCのChrome）で開き、通知を許可して登録
-2. `http://localhost:3000/manager.html` を別端末（店長のスマホ・PC）で開く。初回アクセス時に管理者キー（`.env`の`ADMIN_KEY`）を聞かれるので入力
-3. 店舗名・日付・時間を入れて「全スタッフに通知を送る」
-4. 手順1の端末に通知が届く → タップ → 応募画面が開く → 「このヘルプに入る」で応募
-5. `manager.html`の「募集状況」で担当者が確定したことを確認
+  app.use(cors());
+  app.use(express.json());
+  app.use(express.static(path.join(__dirname, 'public')));
 
-## 本番公開（Render 無料プラン + Supabase）
+  function requireAdmin(req, res, next) {
+    const key = req.headers['x-admin-key'];
+    if (key !== ADMIN_KEY) {
+      return res.status(401).json({ error: '認証エラー：管理者キーが違います' });
+    }
+    next();
+  }
 
-`DEPLOY.md` にgitコマンド不要のデプロイ手順（Supabaseのプロジェクト作成〜GitHubへのアップロード〜Renderへのデプロイ〜動作確認）をまとめてある。月額0円。`render.yaml` は無料プラン（`plan: free`）を前提にした設定済みのBlueprint。
+  app.get('/health', (req, res) => {
+    res.status(200).send('ok');
+  });
 
-## 本番公開時の注意点
+  app.get('/api/vapid-public-key', (req, res) => {
+    res.json({ publicKey: vapidKeys.publicKey });
+  });
 
-- **HTTPS必須。** Push通知はHTTPS（またはlocalhost）でしか動かない。Renderにデプロイすれば自動でHTTPSが付く。
-- **`APP_URL`は基本設定不要。** Render上で動かす場合、Renderが自動で用意する`RENDER_EXTERNAL_URL`をserver.jsが自動的に使う。別ドメインを使う場合のみ`.env`の`APP_URL`で上書きする。
-- **iPhone（Safari）は「ホーム画面に追加」しないと通知許可ボタンが押せない。** スタッフへの案内は`index.html`に既に一言添えてあるが、QRコードを配る場合は「読み取ったら一度ホーム画面に追加してね」と口頭でも伝えるとよい。
-- **Render無料プランは15分アクセスがないとスリープする。** データはSupabase側にあるため消えないが、スリープ復帰時は起動に最大1分ほどかかる。UptimeRobot等で`/health`エンドポイントを5分おきにpingしておくとスリープをほぼ回避できる（手順は`DEPLOY.md`参照、月750時間の無料枠内に収まる想定）。根本的に気にしないなら`render.yaml`の`plan`を`starter`（月$7）に変えるだけでもよい（コード変更は不要）。
-- **`SUPABASE_SERVICE_KEY`は強い権限を持つ秘密鍵。** フロントエンド（`public/`配下）には絶対に書かず、サーバー側の環境変数としてのみ扱うこと。
+  app.post('/api/subscribe', async (req, res) => {
+    const subscription = req.body;
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: '不正なリクエストです' });
+    }
+    try {
+      const { data: existing, error: selErr } = await supabase
+        .from('subscriptions')
+        .select('id')
+        .eq('endpoint', subscription.endpoint)
+        .maybeSingle();
+      if (selErr) throw selErr;
 
-## 今後の拡張候補
+      if (!existing) {
+        const { error: insErr } = await supabase
+          .from('subscriptions')
+          .insert({ endpoint: subscription.endpoint, subscription });
+        if (insErr) throw insErr;
+      }
 
-- 店長側の即時プッシュ配信結果通知（Slack/メールへのサマリ送信など）
-- 「30分応答なしで外部求人サービスへの導線を表示」のような追加ボタン
-- スタッフごとの得意エリア（レジ／惣菜など）タグ付けと絞り込み配信
+      const { count, error: countErr } = await supabase
+        .from('subscriptions')
+        .select('*', { count: 'exact', head: true });
+      if (countErr) throw countErr;
+
+      res.status(201).json({ message: '宛先を保存しました', count });
+    } catch (err) {
+      console.error('subscribe error:', err);
+      res.status(500).json({ error: '宛先の保存に失敗しました' });
+    }
+  });
+
+  app.post('/api/send-broadcast', requireAdmin, async (req, res) => {
+    const { store_name, date, time, note } = req.body;
+    if (!store_name || !date || !time) {
+      return res.status(400).json({ error: '店舗名・日付・時間は必須です' });
+    }
+
+    try {
+      const { data: shift, error: insErr } = await supabase
+        .from('shifts')
+        .insert({ store_name, date, time, note: note || '' })
+        .select()
+        .single();
+      if (insErr) throw insErr;
+
+      const shiftId = shift.id;
+      const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+      const payload = JSON.stringify({
+        title: `🚨【急募】${store_name}`,
+        body: `【日時】${date} ${time}${note ? '\n' + note : ''}\n先着1名です。タップして応募！`,
+        url: `${baseUrl}/respond.html?id=${shiftId}`,
+      });
+
+      const { data: subs, error: subsErr } = await supabase.from('subscriptions').select('*');
+      if (subsErr) throw subsErr;
+
+      let sent = 0;
+      let failed = 0;
+      const staleEndpoints = [];
+
+      await Promise.all(
+        (subs || []).map(async (s) => {
+          try {
+            await webpush.sendNotification(s.subscription, payload);
+            sent++;
+          } catch (err) {
+            failed++;
+            if (err.statusCode === 410 || err.statusCode === 404) {
+              staleEndpoints.push(s.endpoint);
+            }
+            console.error('送信失敗:', err.statusCode, s.endpoint);
+          }
+        })
+      );
+
+      if (staleEndpoints.length) {
+        await supabase.from('subscriptions').delete().in('endpoint', staleEndpoints);
+      }
+
+      res.json({ message: `${sent}台に送信しました（失敗: ${failed}）`, shiftId });
+    } catch (err) {
+      console.error('send-broadcast error:', err);
+      res.status(500).json({ error: '配信に失敗しました' });
+    }
+  });
+
+  app.get('/api/shift/:id', async (req, res) => {
+    const { data, error } = await supabase.from('shifts').select('*').eq('id', req.params.id).maybeSingle();
+    if (error) {
+      console.error('get shift error:', error);
+      return res.status(500).json({ error: '取得に失敗しました' });
+    }
+    if (!data) return res.status(404).json({ error: '募集が見つかりません' });
+    res.json(mapShift(data));
+  });
+
+  app.post('/api/shift/:id/respond', async (req, res) => {
+    try {
+      const { data, error } = await supabase
+        .from('shifts')
+        .update({
+          status: 'filled',
+          filled_by: (req.body && req.body.name) || '匿名スタッフ',
+          filled_at: new Date().toISOString(),
+        })
+        .eq('id', req.params.id)
+        .eq('status', 'open')
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+
+      if (data) {
+        return res.json({ message: '応募が完了しました！ありがとうございます。', shift: mapShift(data) });
+      }
+
+      const { data: existing, error: existErr } = await supabase
+        .from('shifts')
+        .select('*')
+        .eq('id', req.params.id)
+        .maybeSingle();
+      if (existErr) throw existErr;
+      if (!existing) return res.status(404).json({ error: '募集が見つかりません' });
+      return res.status(409).json({ error: '残念、すでに他のスタッフが対応済みです', shift: mapShift(existing) });
+    } catch (err) {
+      console.error('respond error:', err);
+      res.status(500).json({ error: '応募処理に失敗しました' });
+    }
+  });
+
+  app.get('/api/shifts', requireAdmin, async (req, res) => {
+    const { data, error } = await supabase.from('shifts').select('*').order('created_at', { ascending: false });
+    if (error) {
+      console.error('list shifts error:', error);
+      return res.status(500).json({ error: '取得に失敗しました' });
+    }
+    res.json((data || []).map(mapShift));
+  });
+
+  app.listen(PORT, () => console.log(`Server running: http://localhost:${PORT}`));
+}
+
+main().catch((err) => {
+  console.error('起動に失敗しました:', err);
+  process.exit(1);
+});
