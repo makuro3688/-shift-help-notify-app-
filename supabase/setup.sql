@@ -1,123 +1,33 @@
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>店長用ダッシュボード</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; }
-  .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 480px; margin: 0 auto 20px; }
-  h2 { margin-top: 0; }
-  label { display: block; font-size: 13px; color: #555; margin-top: 14px; margin-bottom: 4px; }
-  input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; font-family: inherit; }
-  button { background: #e74c3c; color: white; border: none; padding: 14px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 18px; }
-  button:disabled { background: #ccc; }
-  .status { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }
-  .shift { border-bottom: 1px solid #eee; padding: 10px 0; font-size: 14px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: white; }
-  .badge.open { background: #f39c12; }
-  .badge.filled { background: #27ae60; }
-  .refresh { font-size: 13px; color: #00a8ff; cursor: pointer; float: right; }
-</style>
-</head>
-<body>
+-- Supabaseの SQL Editor にこのまま貼り付けて実行してください。
+-- （Dashboard左メニュー「SQL Editor」→「New query」→ 貼り付け →「Run」）
 
-<div class="card">
-  <h2>🚨 急募を配信</h2>
-  <label>店舗名</label>
-  <input id="store_name" placeholder="例：〇〇店">
-  <label>日付</label>
-  <input id="date" type="date">
-  <label>時間</label>
-  <input id="time" placeholder="例：18:00〜22:00">
-  <label>補足（任意）</label>
-  <textarea id="note" rows="2" placeholder="例：レジ対応できる方"></textarea>
-  <button id="sendBtn" onclick="sendBroadcast()">📣 全スタッフに通知を送る</button>
-  <div id="status" class="status"></div>
-</div>
+-- スタッフの通知宛先（Push Subscription）
+create table if not exists subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  endpoint text unique not null,
+  subscription jsonb not null,
+  registered_at timestamptz not null default now()
+);
 
-<div class="card">
-  <h2>募集状況 <span class="refresh" onclick="loadShifts()">🔄更新</span></h2>
-  <div id="shiftList">読み込み中...</div>
-</div>
+-- 急募（シフト応援）の履歴と状態
+create table if not exists shifts (
+  id uuid primary key default gen_random_uuid(),
+  store_name text not null,
+  date text not null,
+  time text not null,
+  note text default '',
+  status text not null default 'open', -- open | filled
+  filled_by text,
+  filled_at timestamptz,
+  created_at timestamptz not null default now()
+);
 
-<script>
-function getAdminKey() {
-  let key = localStorage.getItem('adminKey');
-  if (!key) {
-    key = prompt('管理者キーを入力してください（.envのADMIN_KEY）');
-    if (key) localStorage.setItem('adminKey', key);
-  }
-  return key;
-}
+-- VAPID鍵など、サーバー起動時に自動生成・再利用する設定値
+create table if not exists app_config (
+  key text primary key,
+  value text not null
+);
 
-async function sendBroadcast() {
-  const store_name = document.getElementById('store_name').value.trim();
-  const date = document.getElementById('date').value;
-  const time = document.getElementById('time').value.trim();
-  const note = document.getElementById('note').value.trim();
-  const statusEl = document.getElementById('status');
-
-  if (!store_name || !date || !time) {
-    statusEl.textContent = '店舗名・日付・時間を入力してください。';
-    return;
-  }
-
-  const btn = document.getElementById('sendBtn');
-  btn.disabled = true;
-  statusEl.textContent = '送信中...';
-
-  try {
-    const res = await fetch('/api/send-broadcast', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-admin-key': getAdminKey() },
-      body: JSON.stringify({ store_name, date, time, note }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      if (res.status === 401) localStorage.removeItem('adminKey');
-      throw new Error(data.error || '送信に失敗しました');
-    }
-    statusEl.textContent = '✅ ' + data.message;
-    loadShifts();
-  } catch (err) {
-    statusEl.textContent = '❌ ' + err.message;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function loadShifts() {
-  const listEl = document.getElementById('shiftList');
-  try {
-    const res = await fetch('/api/shifts', { headers: { 'x-admin-key': getAdminKey() } });
-    const shifts = await res.json();
-    if (!res.ok) throw new Error(shifts.error || '取得に失敗しました');
-    if (!shifts.length) {
-      listEl.textContent = 'まだ募集はありません。';
-      return;
-    }
-    listEl.innerHTML = shifts
-      .map(
-        (s) => `
-      <div class="shift">
-        <span class="badge ${s.status}">${s.status === 'filled' ? '決定' : '募集中'}</span>
-        <strong>${escapeHtml(s.store_name)}</strong> ${escapeHtml(s.date)} ${escapeHtml(s.time)}
-        ${s.status === 'filled' ? `<br>担当：${escapeHtml(s.filledBy)}` : ''}
-      </div>
-    `
-      )
-      .join('');
-  } catch (err) {
-    listEl.textContent = '❌ ' + err.message;
-  }
-}
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-loadShifts();
-</script>
-</body>
-</html>
+-- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
+-- RLS（Row Level Security）は有効化していません（新規テーブルはデフォルトで無効）。
+-- service_roleキーは絶対にフロントエンド（public/配下のファイル）に埋め込まないでください。

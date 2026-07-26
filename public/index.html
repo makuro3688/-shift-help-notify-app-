@@ -3,101 +3,80 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ヘルプ応募</title>
+<title>ヘルプ通知登録</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; text-align: center; }
   .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 400px; margin: 40px auto; }
-  h2 { margin-top: 0; }
-  .detail { text-align: left; background: #f8f9fb; padding: 14px; border-radius: 8px; margin: 16px 0; font-size: 14px; line-height: 1.7; }
-  input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; margin-top: 6px; font-family: inherit; }
-  button { background: #27ae60; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
-  button:disabled { background: #ccc; }
-  .result { margin-top: 16px; font-size: 15px; font-weight: bold; }
-  .filled { color: #e74c3c; }
-  .ok { color: #27ae60; }
+  button { background: #00a8ff; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
+  button:disabled { background: #b0c4d4; }
+  .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; }
+  .status { margin-top: 16px; font-size: 14px; }
 </style>
 </head>
 <body>
-<div class="card" id="card">読み込み中...</div>
+
+<div class="card">
+  <h2>🤝 ヘルプ通知センター</h2>
+  <p style="color:#7f8c8d; font-size:14px; margin-top:10px;">LINEも個人情報も不要です。下のボタンを押して通知を許可してください。</p>
+  <button id="registerBtn" onclick="enablePushNotification()">🔔 通知を許可して登録</button>
+  <div id="status" class="status"></div>
+  <p class="note">
+    iPhoneの方へ：Safariで開いた後、共有ボタン→「ホーム画面に追加」してから、ホーム画面のアイコンで開いて登録してください（Safariのタブのままだと通知が許可できません）。
+  </p>
+</div>
 
 <script>
-const params = new URLSearchParams(location.search);
-const shiftId = params.get('id');
-const card = document.getElementById('card');
-
-async function init() {
-  if (!shiftId) {
-    card.innerHTML = '<p>不正なURLです。</p>';
-    return;
-  }
-  const res = await fetch('/api/shift/' + shiftId);
-  const shift = await res.json();
-  if (!res.ok) {
-    card.innerHTML = `<p>${shift.error || '募集が見つかりません'}</p>`;
-    return;
-  }
-  render(shift);
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
 }
 
-function render(shift) {
-  if (shift.status === 'filled') {
-    card.innerHTML = `
-      <h2>🙏 募集終了</h2>
-      <div class="detail">
-        <strong>${escapeHtml(shift.store_name)}</strong><br>
-        ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
-      </div>
-      <p class="result filled">すでに他のスタッフが対応済みです。ご確認ありがとうございました！</p>
-    `;
+async function enablePushNotification() {
+  const btn = document.getElementById('registerBtn');
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    setStatus('お使いのブラウザはプッシュ通知に対応していません。(iPhoneの場合はホーム画面に追加してから開いてください)');
     return;
   }
-  card.innerHTML = `
-    <h2>🚨 急募のヘルプ</h2>
-    <div class="detail">
-      <strong>${escapeHtml(shift.store_name)}</strong><br>
-      ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
-      ${shift.note ? '<br>' + escapeHtml(shift.note) : ''}
-    </div>
-    <label style="font-size:13px;color:#555;">お名前</label>
-    <input id="name" placeholder="例：山田">
-    <button id="respondBtn" onclick="respond()">✋ このヘルプに入る</button>
-    <div id="result" class="result"></div>
-  `;
-}
 
-async function respond() {
-  const btn = document.getElementById('respondBtn');
-  const resultEl = document.getElementById('result');
-  const name = document.getElementById('name').value.trim();
   btn.disabled = true;
-  resultEl.textContent = '送信中...';
-
   try {
-    const res = await fetch(`/api/shift/${shiftId}/respond`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
-    });
-    const data = await res.json();
-    if (res.status === 409) {
-      resultEl.textContent = '😢 ' + data.error;
-      resultEl.className = 'result filled';
+    const register = await navigator.serviceWorker.register('/sw.js');
+
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      setStatus('通知が拒否されました。ブラウザの設定から許可してください。');
+      btn.disabled = false;
       return;
     }
-    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
-    resultEl.textContent = '✅ ' + data.message;
-    resultEl.className = 'result ok';
+
+    const { publicKey } = await fetch('/api/vapid-public-key').then((r) => r.json());
+
+    const subscription = await register.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+
+    await fetch('/api/subscribe', {
+      method: 'POST',
+      body: JSON.stringify(subscription),
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    setStatus('✅ 通知登録が完了しました！この画面は閉じてOKです。');
   } catch (err) {
-    resultEl.textContent = '❌ ' + err.message;
+    console.error(err);
+    setStatus('登録中にエラーが発生しました：' + err.message);
     btn.disabled = false;
   }
 }
 
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
 }
-
-init();
 </script>
 </body>
 </html>

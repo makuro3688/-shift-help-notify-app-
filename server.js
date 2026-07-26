@@ -16,6 +16,7 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
+// shiftsテーブルの行(snake_case)をフロントエンドが期待する形に変換
 function mapShift(row) {
   return {
     id: row.id,
@@ -41,6 +42,9 @@ async function setConfig(key, value) {
   if (error) throw error;
 }
 
+// --- VAPID鍵：初回のみ生成し、以後はSupabase(app_config)に保存して使い回す ---
+// ローカルファイルに保存する方式だとRenderの無料プランではスリープのたびに消えてしまうため、
+// 外部DBであるSupabaseに保存することで、サーバーが何度再起動・スリープしても鍵が変わらないようにする。
 async function loadOrCreateVapidKeys() {
   const [publicKey, privateKey] = await Promise.all([getConfig('vapid_public_key'), getConfig('vapid_private_key')]);
   if (publicKey && privateKey) return { publicKey, privateKey };
@@ -68,6 +72,7 @@ async function main() {
   app.use(express.json());
   app.use(express.static(path.join(__dirname, 'public')));
 
+  // 店長用エンドポイントの簡易認証
   function requireAdmin(req, res, next) {
     const key = req.headers['x-admin-key'];
     if (key !== ADMIN_KEY) {
@@ -76,14 +81,19 @@ async function main() {
     next();
   }
 
+  // 外形監視(UptimeRobot等)からの死活確認用。DBに触らず即応答するので軽い。
+  // Renderの無料プランは15分無アクセスでスリープするため、これを5〜10分おきにpingすると
+  // スリープを回避できる（月750時間の無料枠内に収まる想定。詳細はDEPLOY.md参照）。
   app.get('/health', (req, res) => {
     res.status(200).send('ok');
   });
 
+  // 公開鍵を配布するエンドポイント
   app.get('/api/vapid-public-key', (req, res) => {
     res.json({ publicKey: vapidKeys.publicKey });
   });
 
+  // スタッフの通知宛先(Subscription)を保存
   app.post('/api/subscribe', async (req, res) => {
     const subscription = req.body;
     if (!subscription || !subscription.endpoint) {
@@ -116,6 +126,7 @@ async function main() {
     }
   });
 
+  // 店長：ヘルプ募集を全スタッフに配信
   app.post('/api/send-broadcast', requireAdmin, async (req, res) => {
     const { store_name, date, time, note } = req.body;
     if (!store_name || !date || !time) {
@@ -131,6 +142,7 @@ async function main() {
       if (insErr) throw insErr;
 
       const shiftId = shift.id;
+      // APP_URLを明示指定していなければ、Renderが自動で用意するURLを使う
       const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
       const payload = JSON.stringify({
         title: `🚨【急募】${store_name}`,
@@ -171,6 +183,7 @@ async function main() {
     }
   });
 
+  // スタッフ：募集の現在の状態を確認（respond.html用）
   app.get('/api/shift/:id', async (req, res) => {
     const { data, error } = await supabase.from('shifts').select('*').eq('id', req.params.id).maybeSingle();
     if (error) {
@@ -181,6 +194,9 @@ async function main() {
     res.json(mapShift(data));
   });
 
+  // スタッフ：先着順で応募する
+  // UPDATE ... WHERE status = 'open' を使うことで、複数人が同時に応募しても
+  // Postgres側で1件しか更新が成功しない（先着順が保証される）。
   app.post('/api/shift/:id/respond', async (req, res) => {
     try {
       const { data, error } = await supabase
@@ -200,6 +216,7 @@ async function main() {
         return res.json({ message: '応募が完了しました！ありがとうございます。', shift: mapShift(data) });
       }
 
+      // 更新が0件だった場合：募集が存在しないか、すでに埋まっているかのどちらか
       const { data: existing, error: existErr } = await supabase
         .from('shifts')
         .select('*')
@@ -214,6 +231,7 @@ async function main() {
     }
   });
 
+  // 店長：募集一覧（ダッシュボード用）
   app.get('/api/shifts', requireAdmin, async (req, res) => {
     const { data, error } = await supabase.from('shifts').select('*').order('created_at', { ascending: false });
     if (error) {

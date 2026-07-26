@@ -2,16 +2,16 @@ services:
   - type: web
     name: shift-help-notify-app
     runtime: node
-    plan: free
-    region: singapore
+    plan: free              # 月額0円。データはSupabase(外部DB)に保存するためディスクは不要
+    region: singapore        # 日本から一番近いリージョン
     buildCommand: npm install
     startCommand: npm start
     envVars:
       - key: ADMIN_KEY
-        generateValue: true
+        generateValue: true   # ランダムな管理者キーを自動生成（Renderダッシュボードで確認できます）
       - key: VAPID_CONTACT_EMAIL
-        sync: false
+        sync: false            # デプロイ時にダッシュボードで入力を求められます
       - key: SUPABASE_URL
-        sync: false
+        sync: false            # SupabaseのProject URL
       - key: SUPABASE_SERVICE_KEY
-        sync: false
+        sync: false            # Supabaseのservice_roleキー（secret）
