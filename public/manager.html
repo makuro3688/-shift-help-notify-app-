@@ -25,6 +25,10 @@
   .linkbox input { font-size: 12px; padding: 8px; border: 1px solid #ddd; border-radius: 6px; }
   .linkbox button { width: auto; padding: 8px 12px; margin-top: 0; font-size: 13px; background: #00a8ff; }
   #qrcode { margin: 14px auto 0; width: 160px; }
+  .guide { margin-top: 18px; background: #f8f9fb; border-radius: 8px; padding: 14px; text-align: left; }
+  .guideTitle { font-size: 13px; font-weight: bold; color: #555; margin: 0 0 8px; }
+  .guideList { margin: 0; padding-left: 18px; font-size: 13px; color: #444; line-height: 1.7; }
+  .guideList li { margin-bottom: 6px; }
 </style>
 </head>
 <body>
@@ -60,6 +64,15 @@
     <button onclick="copyStaffUrl()">コピー</button>
   </div>
   <div id="qrcode"></div>
+  <div class="guide">
+    <p class="guideTitle">📋 スタッフへの案内文（コピーしてお使いください）</p>
+    <ol class="guideList">
+      <li>スマホの通知設定をONにしてください（仕事時間外はOFFでもOKですが、その間は通知が届きません）。iPhoneの方は読み取り後「ホーム画面に追加」してから開いてください。</li>
+      <li>QRコードを読み取り、お名前を入力して登録してください。このアプリは「欠勤発生時の緊急代理募集」以外の連絡には使われません。個人情報も外部に漏れません。</li>
+      <li>先着順です。</li>
+      <li>応募して「応募が完了しました！ありがとうございます！」と表示されたら、代理出勤が確定です。</li>
+    </ol>
+  </div>
 </div>
 
 <script>

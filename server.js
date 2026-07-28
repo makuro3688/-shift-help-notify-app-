@@ -357,7 +357,7 @@ async function main() {
       if (error) throw error;
 
       if (data) {
-        return res.json({ message: '応募が完了しました！ありがとうございます。', shift: mapShift(data) });
+        return res.json({ message: '応募が完了しました！ありがとうございます！', shift: mapShift(data) });
       }
 
       // 更新が0件だった場合：応募している間にすでに他の人が埋めていた
