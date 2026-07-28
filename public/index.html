@@ -7,6 +7,8 @@
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; text-align: center; }
   .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 400px; margin: 40px auto; }
+  label { display: block; font-size: 13px; color: #555; margin-top: 6px; margin-bottom: 4px; text-align: left; }
+  select, input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; font-family: inherit; background: white; }
   button { background: #00a8ff; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
   button:disabled { background: #b0c4d4; }
   .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; }
@@ -15,23 +17,60 @@
 </head>
 <body>
 
-<div class="card">
+<div class="card" id="card">
   <h2>🤝 ヘルプ通知センター</h2>
-  <p style="color:#7f8c8d; font-size:14px; margin-top:10px;">LINEも個人情報も不要です。下のボタンを押して通知を許可してください。</p>
-  <button id="registerBtn" onclick="enablePushNotification()">🔔 通知を許可して登録</button>
-  <div id="status" class="status"></div>
-  <p class="note">
-    iPhoneの方へ：Safariで開いた後、共有ボタン→「ホーム画面に追加」してから、ホーム画面のアイコンで開いて登録してください（Safariのタブのままだと通知が許可できません）。
-  </p>
+  <p id="storeLine" style="color:#7f8c8d; font-size:14px; margin-top:10px;">読み込み中...</p>
+
+  <div id="form" style="display:none;">
+    <label>お名前（あだ名でも可）</label>
+    <input id="staffName" placeholder="例：やまだ">
+
+    <button id="registerBtn" onclick="enablePushNotification()">🔔 通知を許可して登録</button>
+    <div id="status" class="status"></div>
+    <p class="note">
+      iPhoneの方へ：Safariで開いた後、共有ボタン→「ホーム画面に追加」してから、ホーム画面のアイコンで開いて登録してください（Safariのタブのままだと通知が許可できません）。
+    </p>
+  </div>
 </div>
 
 <script>
+const params = new URLSearchParams(location.search);
+const storeId = params.get('store');
+
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
+async function loadStore() {
+  const storeLine = document.getElementById('storeLine');
+  const form = document.getElementById('form');
+  if (!storeId) {
+    storeLine.textContent = 'このリンクは正しくありません。店舗の店長からもらったQRコード・リンクを使って開いてください。';
+    return;
+  }
+  try {
+    const res = await fetch('/api/stores/' + encodeURIComponent(storeId));
+    const data = await res.json();
+    if (!res.ok) {
+      storeLine.textContent = data.error || '店舗が見つかりません。リンクが正しいか確認してください。';
+      return;
+    }
+    storeLine.innerHTML = `<strong>🏬 ${escapeHtml(data.name)}</strong> 向けの通知登録です。LINEも個人情報も不要です。`;
+    form.style.display = 'block';
+  } catch (err) {
+    storeLine.textContent = '店舗情報の取得に失敗しました。';
+  }
+}
+
 async function enablePushNotification() {
   const btn = document.getElementById('registerBtn');
+  const staffName = document.getElementById('staffName').value.trim();
+
+  if (!staffName) {
+    setStatus('お名前（あだ名でも可）を入力してください。');
+    return;
+  }
+
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     setStatus('お使いのブラウザはプッシュ通知に対応していません。(iPhoneの場合はホーム画面に追加してから開いてください)');
     return;
@@ -55,13 +94,15 @@ async function enablePushNotification() {
       applicationServerKey: urlBase64ToUint8Array(publicKey),
     });
 
-    await fetch('/api/subscribe', {
+    const res = await fetch('/api/subscribe', {
       method: 'POST',
-      body: JSON.stringify(subscription),
+      body: JSON.stringify({ subscription, store_id: storeId, staff_name: staffName }),
       headers: { 'Content-Type': 'application/json' },
     });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '登録に失敗しました');
 
-    setStatus('✅ 通知登録が完了しました！この画面は閉じてOKです。');
+    setStatus('✅ ' + data.message + '。この画面は閉じてOKです。');
   } catch (err) {
     console.error(err);
     setStatus('登録中にエラーが発生しました：' + err.message);
@@ -77,6 +118,12 @@ function urlBase64ToUint8Array(base64String) {
   for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
   return outputArray;
 }
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+loadStore();
 </script>
 </body>
 </html>

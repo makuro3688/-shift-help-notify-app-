@@ -9,7 +9,7 @@ gitコマンドは使わず、すべてブラウザ操作だけで完結する�
 1. https://supabase.com にアクセスし、アカウント作成（GitHubアカウントでのサインアップが早い）
 2. 「New project」でプロジェクトを作成（名前は任意、パスワードは自動生成のままでOK、リージョンは`Northeast Asia (Tokyo)`など近いものを選択）
 3. プロジェクトが立ち上がったら、左メニューの「SQL Editor」→「New query」を開く
-4. このリポジトリの `supabase/setup.sql` の中身を全部貼り付けて「Run」をクリック（`subscriptions`・`shifts`・`app_config`の3テーブルが作成される）
+4. このリポジトリの `supabase/setup.sql` の中身を全部貼り付けて「Run」をクリック（`stores`・`subscriptions`・`shifts`・`app_config`の4テーブルが作成される）
 5. 左メニューの「Project Settings」（歯車アイコン）→「API」を開く
    - 「Project URL」をコピー → これが後で使う `SUPABASE_URL`
    - 「Project API keys」の中の **`service_role`**（`anon`ではない方）をコピー → これが `SUPABASE_SERVICE_KEY`
@@ -40,23 +40,36 @@ gitコマンドは使わず、すべてブラウザ操作だけで完結する�
    - `VAPID_CONTACT_EMAIL`：連絡先メールアドレスを入力（実際に受信できるアドレスでなくても動作する）
    - `SUPABASE_URL`：手順1でコピーしたProject URL
    - `SUPABASE_SERVICE_KEY`：手順1でコピーしたservice_roleキー
-   - `ADMIN_KEY` は自動生成されるため入力不要
+   - 店舗名や管理者キーの入力欄はない（デプロイ後、店長が`/signup.html`から自分で店舗を作成する）
 4. 「Apply」でデプロイ開始。初回ビルドは数分かかる
 5. デプロイ完了後、サービスのURL（`https://shift-help-notify-app-xxxx.onrender.com`のような形式）が発行される
 
 ## 5. 動作確認
 
-1. 発行されたURLをスマホで開き（`/`）、通知登録
-2. `/manager.html` を開く。管理者キーを聞かれるので、Renderダッシュボードの該当サービス →「Environment」タブ →`ADMIN_KEY`の値をコピーして入力
-3. 急募を配信 → 手順1の端末に通知が届くか確認
-4. 通知をタップ →応募画面→「このヘルプに入る」→ `manager.html`の募集状況に反映されるか確認
-5. Supabaseダッシュボードの「Table Editor」で`subscriptions`・`shifts`テーブルにデータが入っていることも確認できる（Excel感覚で中身を目視・編集できる）
+1. 発行されたURLの末尾に`/signup.html`を付けて開き（例：`https://.../signup.html`）、店舗名を入力して「登録する」
+2. 表示された「管理者キー」をコピーしてメモしておく（この画面を閉じると二度と表示されない）
+3. 同じ画面の「スタッフ登録用リンク」をスマホで開き（QRコードを読み取ってもよい）、お名前を入力して通知を許可・登録
+4. `/manager.html` を開く。管理者キーを聞かれるので、手順2で控えたキーを入力。画面上部に自分の店舗名が表示されれば認証成功
+5. 日付・時間を入れて「自分の店舗のスタッフに通知を送る」→ 手順3の端末に通知が届くか確認
+6. 通知をタップ →応募画面→「このヘルプに入る」→ `manager.html`の募集状況に反映されるか確認
+7. Supabaseダッシュボードの「Table Editor」で`stores`・`subscriptions`・`shifts`テーブルにデータが入っていることも確認できる（Excel感覚で中身を目視・編集できる）
 
 ## 6. 今後コードを更新する時
 
 GitHubのリポジトリ画面で該当ファイルを開き「Edit」（鉛筆アイコン）→編集→Commit、で更新できます。RenderはGitHubリポジトリの変更を検知して自動的に再デプロイします。まとまった変更が増えてきたら、GitHub Desktop（GUIアプリ、gitコマンド不要）の導入がおすすめです。
 
-## 7. スリープを防ぐ（UptimeRobotで無料のまま常時起動に近づける）
+## 7. 既に公開済みのアプリを「店長の自己登録方式」に切り替える場合
+
+⚠️ この移行は既存の`subscriptions`・`shifts`テーブルを作り直すため、それまでに登録されていたデータ（スタッフの通知宛先・募集履歴）は消える。本番の実利用者がまだいない段階での移行を想定した手順。
+
+1. Supabaseダッシュボード →「SQL Editor」で `supabase/migration_003_multi_tenant.sql` の中身を実行（`stores`テーブルの新設、`subscriptions`・`shifts`の作り直し）
+2. Renderダッシュボード → 該当サービス →「Environment」タブを開き、古い`STORE_NAMES`・`ADMIN_KEYS`（または`ADMIN_KEY`）があれば削除する（もう使わない）
+3. `server.js`・`public/index.html`・`public/manager.html`・`public/respond.html`をGitHub上で最新版に更新し、新しく`public/signup.html`を追加（GitHub Desktopまたはブラウザの直接編集）
+4. Renderが自動で再デプロイする（または「Manual Deploy」→「Deploy latest commit」で手動実行）
+5. 再デプロイ後、`/signup.html`から店舗を作り直してもらう（店舗ごとに新しい管理者キーとスタッフ登録用リンク/QRコードが発行される）
+6. 店長には新しい管理者キーを、スタッフには新しい登録用リンク/QRコードを個別に配り直してもらう（古いURLの`/`はスタッフ登録に使えなくなるため、`/signup.html`で発行された`?store=店舗ID`付きのリンクに差し替える）
+
+## 8. スリープを防ぐ（UptimeRobotで無料のまま常時起動に近づける）
 
 Render無料プランは15分アクセスがないと自動スリープし、復帰に最大1分ほどかかります。外形監視サービスで数分おきにアクセスさせておくと、スリープする前に毎回リセットされるため、実質いつでもすぐ通知が飛ぶ状態を保てます。
 

@@ -4,36 +4,41 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>店長用ダッシュボード</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; }
   .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 480px; margin: 0 auto 20px; }
   h2 { margin-top: 0; }
+  .store-badge { display: inline-block; background: #eef6ff; color: #00639b; padding: 4px 10px; border-radius: 8px; font-size: 13px; font-weight: bold; margin-bottom: 8px; }
   label { display: block; font-size: 13px; color: #555; margin-top: 14px; margin-bottom: 4px; }
-  input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; font-family: inherit; }
+  input, textarea, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; font-family: inherit; background: white; }
   button { background: #e74c3c; color: white; border: none; padding: 14px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 18px; }
   button:disabled { background: #ccc; }
   .status { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }
   .shift { border-bottom: 1px solid #eee; padding: 10px 0; font-size: 14px; }
+  .staffRow { border-bottom: 1px solid #eee; padding: 8px 0; font-size: 14px; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: white; }
   .badge.open { background: #f39c12; }
   .badge.filled { background: #27ae60; }
   .refresh { font-size: 13px; color: #00a8ff; cursor: pointer; float: right; }
+  .linkbox { display: flex; gap: 8px; margin-top: 6px; }
+  .linkbox input { font-size: 12px; padding: 8px; border: 1px solid #ddd; border-radius: 6px; }
+  .linkbox button { width: auto; padding: 8px 12px; margin-top: 0; font-size: 13px; background: #00a8ff; }
+  #qrcode { margin: 14px auto 0; width: 160px; }
 </style>
 </head>
 <body>
 
 <div class="card">
+  <div id="storeBadge" class="store-badge">店舗を確認中...</div>
   <h2>🚨 急募を配信</h2>
-  <label>店舗名</label>
-  <input id="store_name" placeholder="例：〇〇店" list="storeNameHistory" autocomplete="off">
-  <datalist id="storeNameHistory"></datalist>
   <label>日付</label>
   <input id="date" type="date">
   <label>時間</label>
   <input id="time" placeholder="例：18:00〜22:00">
   <label>補足（任意）</label>
   <textarea id="note" rows="2" placeholder="例：レジ対応できる方"></textarea>
-  <button id="sendBtn" onclick="sendBroadcast()">📣 全スタッフに通知を送る</button>
+  <button id="sendBtn" onclick="sendBroadcast()">📣 自分の店舗のスタッフに通知を送る</button>
   <div id="status" class="status"></div>
 </div>
 
@@ -42,25 +47,77 @@
   <div id="shiftList">読み込み中...</div>
 </div>
 
+<div class="card">
+  <h2>登録スタッフ <span class="refresh" onclick="loadStaff()">🔄更新</span></h2>
+  <div id="staffList">読み込み中...</div>
+</div>
+
+<div class="card">
+  <h2>スタッフ登録用リンク・QRコード</h2>
+  <p style="font-size:13px;color:#555;margin-top:-8px;">このQRコード・リンクをスタッフに配ってください。読み取った先で名前を入力して通知登録すると、この店舗のスタッフ一覧に追加されます。</p>
+  <div class="linkbox">
+    <input id="staffUrlOut" readonly>
+    <button onclick="copyStaffUrl()">コピー</button>
+  </div>
+  <div id="qrcode"></div>
+</div>
+
 <script>
 function getAdminKey() {
   let key = localStorage.getItem('adminKey');
   if (!key) {
-    key = prompt('管理者キーを入力してください（.envのADMIN_KEY）');
+    key = prompt('管理者キーを入力してください（自分の店舗用のキー）');
     if (key) localStorage.setItem('adminKey', key);
   }
   return key;
 }
 
+function authHeaders() {
+  return { 'x-admin-key': getAdminKey() };
+}
+
+let currentStoreId = null;
+
+async function loadMe() {
+  const badge = document.getElementById('storeBadge');
+  try {
+    const res = await fetch('/api/me', { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) localStorage.removeItem('adminKey');
+      throw new Error(data.error || '認証に失敗しました');
+    }
+    badge.textContent = '🏬 ' + data.storeName;
+    currentStoreId = data.storeId;
+    renderStaffLink();
+  } catch (err) {
+    badge.textContent = '❌ ' + err.message;
+  }
+}
+
+function renderStaffLink() {
+  if (!currentStoreId) return;
+  const url = `${location.origin}/?store=${currentStoreId}`;
+  document.getElementById('staffUrlOut').value = url;
+  document.getElementById('qrcode').innerHTML = '';
+  new QRCode(document.getElementById('qrcode'), { text: url, width: 160, height: 160 });
+}
+
+function copyStaffUrl() {
+  const el = document.getElementById('staffUrlOut');
+  el.select();
+  el.setSelectionRange(0, 99999);
+  navigator.clipboard.writeText(el.value).catch(() => document.execCommand('copy'));
+}
+
 async function sendBroadcast() {
-  const store_name = document.getElementById('store_name').value.trim();
   const date = document.getElementById('date').value;
   const time = document.getElementById('time').value.trim();
   const note = document.getElementById('note').value.trim();
   const statusEl = document.getElementById('status');
 
-  if (!store_name || !date || !time) {
-    statusEl.textContent = '店舗名・日付・時間を入力してください。';
+  if (!date || !time) {
+    statusEl.textContent = '日付・時間を入力してください。';
     return;
   }
 
@@ -71,8 +128,8 @@ async function sendBroadcast() {
   try {
     const res = await fetch('/api/send-broadcast', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-admin-key': getAdminKey() },
-      body: JSON.stringify({ store_name, date, time, note }),
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ date, time, note }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -91,12 +148,9 @@ async function sendBroadcast() {
 async function loadShifts() {
   const listEl = document.getElementById('shiftList');
   try {
-    const res = await fetch('/api/shifts', { headers: { 'x-admin-key': getAdminKey() } });
+    const res = await fetch('/api/shifts', { headers: authHeaders() });
     const shifts = await res.json();
     if (!res.ok) throw new Error(shifts.error || '取得に失敗しました');
-
-    // 過去に配信した店舗名をタッチ候補（datalist）として表示する
-    updateStoreNameHistory(shifts);
 
     if (!shifts.length) {
       listEl.textContent = 'まだ募集はありません。';
@@ -118,24 +172,32 @@ async function loadShifts() {
   }
 }
 
-function updateStoreNameHistory(shifts) {
-  const datalist = document.getElementById('storeNameHistory');
-  const seen = new Set();
-  const names = [];
-  for (const s of shifts) {
-    if (s.store_name && !seen.has(s.store_name)) {
-      seen.add(s.store_name);
-      names.push(s.store_name);
+async function loadStaff() {
+  const listEl = document.getElementById('staffList');
+  try {
+    const res = await fetch('/api/staff', { headers: authHeaders() });
+    const staff = await res.json();
+    if (!res.ok) throw new Error(staff.error || '取得に失敗しました');
+
+    if (!staff.length) {
+      listEl.textContent = 'まだ登録スタッフはいません。';
+      return;
     }
+    listEl.innerHTML = staff
+      .map((s) => `<div class="staffRow">👤 ${escapeHtml(s.staffName)}</div>`)
+      .join('');
+  } catch (err) {
+    listEl.textContent = '❌ ' + err.message;
   }
-  datalist.innerHTML = names.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
 }
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+loadMe();
 loadShifts();
+loadStaff();
 </script>
 </body>
 </html>

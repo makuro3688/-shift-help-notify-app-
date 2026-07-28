@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>店舗登録</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; }
+  .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 460px; margin: 40px auto; }
+  h2 { margin-top: 0; }
+  label { display: block; font-size: 13px; color: #555; margin-top: 6px; margin-bottom: 4px; text-align: left; }
+  input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; font-family: inherit; background: white; }
+  button { background: #00a8ff; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
+  button:disabled { background: #b0c4d4; }
+  .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; text-align: left; }
+  .status { margin-top: 16px; font-size: 14px; }
+  .result { display: none; }
+  .warn { background: #fff6e6; border: 1px solid #f5c96b; border-radius: 8px; padding: 14px; margin-top: 16px; font-size: 13px; text-align: left; line-height: 1.7; }
+  .keybox { display: flex; gap: 8px; margin-top: 6px; }
+  .keybox input { font-family: monospace; font-size: 13px; }
+  .keybox button { width: auto; padding: 10px 14px; margin-top: 0; font-size: 13px; }
+  .linkbox { display: flex; gap: 8px; margin-top: 6px; }
+  .linkbox input { font-size: 12px; }
+  .linkbox button { width: auto; padding: 10px 14px; margin-top: 0; font-size: 13px; }
+  #qrcode { margin: 16px auto 0; width: 200px; }
+  .section { margin-top: 24px; padding-top: 20px; border-top: 1px solid #eee; text-align: left; }
+</style>
+</head>
+<body>
+
+<div class="card" id="card">
+  <h2>🏬 店舗の新規登録</h2>
+  <p style="color:#7f8c8d; font-size:14px;">店舗名を入力するだけで、その場ですぐに使い始められます（他の店舗と店舗名が同じでも問題ありません）。</p>
+
+  <div id="formArea">
+    <label>店舗名</label>
+    <input id="storeName" placeholder="例：〇〇店">
+    <button id="submitBtn" onclick="createStore()">登録する</button>
+    <div id="status" class="status"></div>
+  </div>
+
+  <div id="resultArea" class="result">
+    <div class="warn">
+      ⚠️ 下の「管理者キー」は<strong>この画面を閉じると二度と表示されません。</strong>必ずコピーしてメモや社内共有ツールなどに保存してください。このキーが店長用ダッシュボードのログインパスワードになります。
+    </div>
+
+    <div class="section">
+      <label>管理者キー（店長用ダッシュボードのログインに使用）</label>
+      <div class="keybox">
+        <input id="adminKeyOut" readonly>
+        <button onclick="copyField('adminKeyOut')">コピー</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>店長用ダッシュボードのURL</label>
+      <div class="linkbox">
+        <input id="managerUrlOut" readonly>
+        <button onclick="copyField('managerUrlOut')">コピー</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <label>スタッフ登録用リンク（このQRコード・URLをスタッフに配ってください）</label>
+      <div class="linkbox">
+        <input id="staffUrlOut" readonly>
+        <button onclick="copyField('staffUrlOut')">コピー</button>
+      </div>
+      <div id="qrcode"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+async function createStore() {
+  const btn = document.getElementById('submitBtn');
+  const statusEl = document.getElementById('status');
+  const name = document.getElementById('storeName').value.trim();
+  if (!name) {
+    statusEl.textContent = '店舗名を入力してください。';
+    return;
+  }
+  btn.disabled = true;
+  statusEl.textContent = '登録中...';
+
+  try {
+    const res = await fetch('/api/stores', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '登録に失敗しました');
+
+    const origin = location.origin;
+    const staffUrl = `${origin}/?store=${data.storeId}`;
+    const managerUrl = `${origin}/manager.html`;
+
+    document.getElementById('adminKeyOut').value = data.adminKey;
+    document.getElementById('managerUrlOut').value = managerUrl;
+    document.getElementById('staffUrlOut').value = staffUrl;
+
+    document.getElementById('formArea').style.display = 'none';
+    document.getElementById('resultArea').style.display = 'block';
+
+    new QRCode(document.getElementById('qrcode'), {
+      text: staffUrl,
+      width: 200,
+      height: 200,
+    });
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+    btn.disabled = false;
+  }
+}
+
+function copyField(id) {
+  const el = document.getElementById(id);
+  el.select();
+  el.setSelectionRange(0, 99999);
+  navigator.clipboard.writeText(el.value).catch(() => document.execCommand('copy'));
+}
+</script>
+</body>
+</html>

@@ -7,8 +7,6 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: ADMIN_KEY
-        generateValue: true   # ランダムな管理者キーを自動生成（Renderダッシュボードで確認できます）
       - key: VAPID_CONTACT_EMAIL
         sync: false            # デプロイ時にダッシュボードで入力を求められます
       - key: SUPABASE_URL
