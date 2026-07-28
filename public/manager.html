@@ -26,9 +26,12 @@
   .linkbox button { width: auto; padding: 8px 12px; margin-top: 0; font-size: 13px; background: #00a8ff; }
   #qrcode { margin: 14px auto 0; width: 160px; }
   .guide { margin-top: 18px; background: #f8f9fb; border-radius: 8px; padding: 14px; text-align: left; }
-  .guideTitle { font-size: 13px; font-weight: bold; color: #555; margin: 0 0 8px; }
+  .guideTitle { font-size: 14px; font-weight: bold; color: #333; margin: 0 0 4px; }
+  .guideSection { font-size: 13px; font-weight: bold; color: #333; margin: 16px 0 6px; }
   .guideList { margin: 0; padding-left: 18px; font-size: 13px; color: #444; line-height: 1.7; }
-  .guideList li { margin-bottom: 6px; }
+  .guideList li { margin-bottom: 8px; }
+  .guideText { margin: 0 0 8px; font-size: 13px; color: #444; line-height: 1.7; }
+  .guideNote { margin: 12px 0 0; font-size: 12px; color: #888; }
 </style>
 </head>
 <body>
@@ -65,13 +68,27 @@
   </div>
   <div id="qrcode"></div>
   <div class="guide">
-    <p class="guideTitle">📋 スタッフへの案内文（コピーしてお使いください）</p>
-    <ol class="guideList">
-      <li>スマホの通知設定をONにしてください（仕事時間外はOFFでもOKですが、その間は通知が届きません）。iPhoneの方は読み取り後「ホーム画面に追加」してから開いてください。</li>
-      <li>QRコードを読み取り、お名前を入力して登録してください。このアプリは「欠勤発生時の緊急代理募集」以外の連絡には使われません。個人情報も外部に漏れません。</li>
-      <li>先着順です。</li>
-      <li>応募して「応募が完了しました！ありがとうございます！」と表示されたら、代理出勤が確定です。</li>
-    </ol>
+    <p class="guideTitle">📋 スタッフの皆様へ</p>
+
+    <p class="guideSection">初回登録のお願い</p>
+    <ul class="guideList">
+      <li>iPhoneをご利用の方は、QRコードを読み取った後、まず<strong>「ホーム画面に追加」</strong>してから開いてください（Safariのタブのままだと通知が許可できません）。</li>
+      <li>QRコードを読み取り、お名前を入力して登録してください。</li>
+      <li>登録の途中で「通知を許可しますか？」と表示されたら<strong>「許可」</strong>を選んでください。これはこのアプリ専用の通知設定で、LINEなど他のアプリの通知には一切影響しません。（勤務時間外はオフにしていただいても構いませんが、その間はこのアプリからの通知も届きません。）</li>
+    </ul>
+
+    <p class="guideSection">このアプリについて</p>
+    <p class="guideText">
+      このアプリは、欠勤が発生した際の緊急代理募集専用です。それ以外の連絡には使用できません。<br>
+      また、登録いただいた個人情報が外部へ漏れることはありません。
+    </p>
+
+    <p class="guideSection">応募方法</p>
+    <p class="guideText">
+      代理募集が届いたら、希望される方は応募してください。<br>
+      <strong>「応募が完了しました！ありがとうございます！」</strong>と表示された時点で、代理出勤が確定となります。
+    </p>
+    <p class="guideNote">※代理募集は先着順です。</p>
   </div>
 </div>
 
