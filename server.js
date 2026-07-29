@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
+const Stripe = require('stripe');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,6 +16,82 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
 }
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+// --- 課金（Stripe）関連の設定 ---
+// STRIPE_SECRET_KEYが未設定でもアプリ自体は動く（決済ページの作成だけができない）。
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+const STRIPE_PRICES = {
+  monthly: process.env.STRIPE_PRICE_MONTHLY,
+  quarterly: process.env.STRIPE_PRICE_QUARTERLY,
+  yearly: process.env.STRIPE_PRICE_YEARLY,
+};
+
+const PLAN_LABELS = {
+  monthly: { label: '月額プラン', priceJPY: 980, interval: '1か月ごと' },
+  quarterly: { label: '3か月プラン（20%OFF）', priceJPY: 2352, interval: '3か月ごと' },
+  yearly: { label: '年間プラン（50%OFF）', priceJPY: 5880, interval: '1年ごと' },
+};
+
+// 無料期間：店舗登録から1か月間は配信回数の制限なし
+const FREE_TRIAL_MONTHS = 1;
+// 無料期間終了後、毎月2回までは無料。3回目の配信からは有料プランが必要
+const FREE_MONTHLY_BROADCASTS = 2;
+
+function trialEndsAt(store) {
+  const end = new Date(store.created_at);
+  end.setMonth(end.getMonth() + FREE_TRIAL_MONTHS);
+  return end;
+}
+
+function hasActiveSubscription(store) {
+  return (
+    store.subscription_status === 'active' &&
+    !!store.current_period_end &&
+    new Date(store.current_period_end) > new Date()
+  );
+}
+
+function planFromPriceId(priceId) {
+  if (!priceId) return null;
+  if (priceId === process.env.STRIPE_PRICE_MONTHLY) return 'monthly';
+  if (priceId === process.env.STRIPE_PRICE_QUARTERLY) return 'quarterly';
+  if (priceId === process.env.STRIPE_PRICE_YEARLY) return 'yearly';
+  return null;
+}
+
+// その店舗が「今月すでに何回配信したか」をshiftsテーブルから数える
+// （専用カウンターテーブルを持たず、実績から毎回集計することで月替わりの処理を単純化している）
+async function getMonthlyBroadcastCount(storeId) {
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const { count, error } = await supabase
+    .from('shifts')
+    .select('*', { count: 'exact', head: true })
+    .eq('store_id', storeId)
+    .gte('created_at', startOfMonth);
+  if (error) throw error;
+  return count || 0;
+}
+
+// 配信してよいかどうかを判定する。
+// 1. 登録から1か月以内 → 無条件で許可（無料期間）
+// 2. 有料プラン契約中（current_period_end内） → 許可
+// 3. それ以外 → 今月の配信回数が2回未満なら許可、2回以上なら要アップグレード
+async function checkBroadcastAllowed(store) {
+  const now = new Date();
+  if (now < trialEndsAt(store)) {
+    return { allowed: true, reason: 'trial' };
+  }
+  if (hasActiveSubscription(store)) {
+    return { allowed: true, reason: 'subscribed' };
+  }
+  const countThisMonth = await getMonthlyBroadcastCount(store.id);
+  if (countThisMonth >= FREE_MONTHLY_BROADCASTS) {
+    return { allowed: false, reason: 'quota_exceeded', countThisMonth };
+  }
+  return { allowed: true, reason: 'free_quota', countThisMonth };
+}
 
 // 店舗は「店舗名の文字列一致」ではなく、自動採番されるID(stores.id)で区別する。
 // これにより、別々の会社が同じ店舗名（例："牛久店"）を使っても内部的には別物として扱われ、
@@ -80,14 +157,87 @@ async function main() {
   console.log('=========================================');
   console.log('🔑 PUBLIC VAPID KEY:', vapidKeys.publicKey);
   console.log('=========================================');
+  if (!stripe) {
+    console.log('ℹ️ STRIPE_SECRET_KEY未設定：課金アップグレード機能は無効です（無料枠のロジックは動作します）');
+  }
 
   app.use(cors());
+
+  // Stripe Webhookはリクエストボディの生データ（raw body）が必要なため、
+  // 全体にexpress.json()をかける前に、このルートだけ個別に登録する。
+  app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+      return res.status(500).send('Stripe webhook is not configured');
+    }
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      console.error('Webhook signature verification failed:', err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      // 同じイベントを二重処理しないための簡易チェック
+      const { error: dupCheckErr } = await supabase.from('stripe_events').insert({ id: event.id });
+      if (dupCheckErr && dupCheckErr.code === '23505') {
+        // 既に処理済みのイベント（一意制約違反）
+        return res.json({ received: true, duplicate: true });
+      }
+
+      switch (event.type) {
+        case 'checkout.session.completed': {
+          const session = event.data.object;
+          const storeId = session.metadata && session.metadata.store_id;
+          if (storeId && session.subscription) {
+            const sub = await stripe.subscriptions.retrieve(session.subscription);
+            const plan = planFromPriceId(sub.items.data[0].price.id);
+            await supabase
+              .from('stores')
+              .update({
+                stripe_customer_id: session.customer,
+                stripe_subscription_id: sub.id,
+                subscription_status: sub.status,
+                subscription_plan: plan,
+                current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
+              })
+              .eq('id', storeId);
+          }
+          break;
+        }
+        case 'customer.subscription.updated':
+        case 'customer.subscription.deleted': {
+          const sub = event.data.object;
+          const storeId = sub.metadata && sub.metadata.store_id;
+          if (storeId) {
+            const plan = sub.items && sub.items.data[0] ? planFromPriceId(sub.items.data[0].price.id) : null;
+            await supabase
+              .from('stores')
+              .update({
+                subscription_status: event.type === 'customer.subscription.deleted' ? 'canceled' : sub.status,
+                subscription_plan: plan,
+                current_period_end: sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null,
+              })
+              .eq('id', storeId);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+      res.json({ received: true });
+    } catch (err) {
+      console.error('webhook handling error:', err);
+      res.status(500).send('Webhook handler error');
+    }
+  });
+
   app.use(express.json());
   app.use(express.static(path.join(__dirname, 'public')));
 
   // 店長用エンドポイントの認証。管理者キーをハッシュ化し、一致する店舗をDBから探す。
   // 見つかった店舗のIDを req.storeId に入れることで、店長は自分の店舗の情報しか
-  // 見えない・配信できない状態になる。
+  // 見えない・配信できない状態になる。課金判定に使う情報もあわせて req.store に入れる。
   async function requireAdmin(req, res, next) {
     const key = req.headers['x-admin-key'];
     if (!key) {
@@ -96,7 +246,9 @@ async function main() {
     try {
       const { data: store, error } = await supabase
         .from('stores')
-        .select('id, name')
+        .select(
+          'id, name, created_at, subscription_status, subscription_plan, stripe_customer_id, stripe_subscription_id, current_period_end'
+        )
         .eq('admin_key_hash', hashKey(key))
         .maybeSingle();
       if (error) throw error;
@@ -105,6 +257,7 @@ async function main() {
       }
       req.storeId = store.id;
       req.storeName = store.name;
+      req.store = store;
       next();
     } catch (err) {
       console.error('auth error:', err);
@@ -165,6 +318,80 @@ async function main() {
   // ログイン中の店長の店舗情報を返す（管理者キーに紐づく店舗）
   app.get('/api/me', requireAdmin, (req, res) => {
     res.json({ storeId: req.storeId, storeName: req.storeName });
+  });
+
+  // 課金状況（無料期間・今月の残り無料回数・契約中プラン等）をダッシュボードに返す
+  app.get('/api/subscription-status', requireAdmin, async (req, res) => {
+    try {
+      const store = req.store;
+      const now = new Date();
+      const trialEnd = trialEndsAt(store);
+      const inTrial = now < trialEnd;
+      const subscribed = hasActiveSubscription(store);
+
+      let broadcastsThisMonth = 0;
+      let freeRemaining = null;
+      if (!inTrial && !subscribed) {
+        broadcastsThisMonth = await getMonthlyBroadcastCount(store.id);
+        freeRemaining = Math.max(0, FREE_MONTHLY_BROADCASTS - broadcastsThisMonth);
+      }
+
+      res.json({
+        inTrial,
+        trialEndsAt: trialEnd.toISOString(),
+        subscribed,
+        subscriptionStatus: store.subscription_status,
+        subscriptionPlan: store.subscription_plan,
+        currentPeriodEnd: store.current_period_end,
+        broadcastsThisMonth,
+        freeRemaining,
+        freeMonthlyBroadcasts: FREE_MONTHLY_BROADCASTS,
+        stripeEnabled: !!stripe,
+        plans: PLAN_LABELS,
+      });
+    } catch (err) {
+      console.error('subscription-status error:', err);
+      res.status(500).json({ error: '取得に失敗しました' });
+    }
+  });
+
+  // アップグレード用のStripe Checkoutセッションを作成し、遷移先URLを返す
+  app.post('/api/create-checkout-session', requireAdmin, async (req, res) => {
+    if (!stripe) {
+      return res.status(500).json({ error: '決済機能が設定されていません（管理者にお問い合わせください）' });
+    }
+    const plan = req.body && req.body.plan;
+    const priceId = STRIPE_PRICES[plan];
+    if (!priceId) {
+      return res.status(400).json({ error: '不正なプランです' });
+    }
+    try {
+      const store = req.store;
+      let customerId = store.stripe_customer_id;
+      if (!customerId) {
+        const customer = await stripe.customers.create({
+          name: store.name,
+          metadata: { store_id: store.id },
+        });
+        customerId = customer.id;
+        await supabase.from('stores').update({ stripe_customer_id: customerId }).eq('id', store.id);
+      }
+
+      const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+      const session = await stripe.checkout.sessions.create({
+        mode: 'subscription',
+        customer: customerId,
+        line_items: [{ price: priceId, quantity: 1 }],
+        success_url: `${baseUrl}/manager.html?checkout=success`,
+        cancel_url: `${baseUrl}/manager.html?checkout=cancel`,
+        metadata: { store_id: store.id },
+        subscription_data: { metadata: { store_id: store.id } },
+      });
+      res.json({ url: session.url });
+    } catch (err) {
+      console.error('create-checkout-session error:', err);
+      res.status(500).json({ error: '決済ページの作成に失敗しました' });
+    }
   });
 
   // スタッフの通知宛先(Subscription)を保存。どの店舗・誰の登録かも一緒に記録する。
@@ -238,6 +465,14 @@ async function main() {
     }
 
     try {
+      const check = await checkBroadcastAllowed(req.store);
+      if (!check.allowed) {
+        return res.status(402).json({
+          error: `今月の無料配信回数（${FREE_MONTHLY_BROADCASTS}回）を超えました。プランをアップグレードすると引き続きご利用いただけます。`,
+          upgradeRequired: true,
+        });
+      }
+
       const { data: shift, error: insErr } = await supabase
         .from('shifts')
         .insert({ store_id: storeId, store_name: storeName, date, time, note: note || '' })

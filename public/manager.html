@@ -34,6 +34,17 @@
   .guideText { margin: 0 0 8px; font-size: 13px; color: #444; line-height: 1.7; }
   .guideNote { margin: 12px 0 0; font-size: 12px; color: #888; }
   .guideSub { display: block; font-size: 11px; color: #888; margin-top: 4px; line-height: 1.6; }
+  .planStatus { font-size: 14px; color: #444; line-height: 1.7; background: #f8f9fb; border-radius: 8px; padding: 12px 14px; }
+  .planStatus.warn { background: #fff6e6; color: #8a5a00; }
+  .planStatus.ok { background: #eafaf0; color: #1e7e45; }
+  .planGrid { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+  .planOption { border: 1px solid #eee; border-radius: 8px; padding: 12px 14px; }
+  .planName { font-size: 14px; font-weight: bold; color: #333; }
+  .planOff { display: inline-block; margin-left: 6px; background: #e74c3c; color: white; font-size: 11px; padding: 1px 6px; border-radius: 10px; font-weight: bold; vertical-align: middle; }
+  .planPrice { font-size: 20px; font-weight: bold; color: #e74c3c; margin-top: 4px; }
+  .planPrice span { font-size: 12px; font-weight: normal; color: #888; margin-left: 2px; }
+  .planOption button { margin-top: 10px; padding: 10px; font-size: 14px; background: #00a8ff; }
+  .planNote { font-size: 12px; color: #888; margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -50,6 +61,29 @@
   <textarea id="note" rows="2" placeholder="例：レジ対応できる方"></textarea>
   <button id="sendBtn" onclick="sendBroadcast()">📣 自分の店舗のスタッフに通知を送る</button>
   <div id="status" class="status"></div>
+</div>
+
+<div class="card">
+  <h2>💳 ご利用プラン</h2>
+  <div id="planStatus" class="planStatus">読み込み中...</div>
+  <div id="planOptions" class="planGrid" style="display:none;">
+    <div class="planOption">
+      <div class="planName">月額プラン</div>
+      <div class="planPrice">980円<span>/1か月</span></div>
+      <button onclick="startCheckout('monthly')">このプランにする</button>
+    </div>
+    <div class="planOption">
+      <div class="planName">3か月プラン<span class="planOff">20%OFF</span></div>
+      <div class="planPrice">2,352円<span>/3か月</span></div>
+      <button onclick="startCheckout('quarterly')">このプランにする</button>
+    </div>
+    <div class="planOption">
+      <div class="planName">年間プラン<span class="planOff">50%OFF</span></div>
+      <div class="planPrice">5,880円<span>/1年</span></div>
+      <button onclick="startCheckout('yearly')">このプランにする</button>
+    </div>
+  </div>
+  <p id="planNote" class="planNote"></p>
 </div>
 
 <div class="card">
@@ -174,10 +208,16 @@ async function sendBroadcast() {
     const data = await res.json();
     if (!res.ok) {
       if (res.status === 401) localStorage.removeItem('adminKey');
+      if (res.status === 402) {
+        statusEl.textContent = '💳 ' + data.error;
+        loadSubscriptionStatus();
+        return;
+      }
       throw new Error(data.error || '送信に失敗しました');
     }
     statusEl.textContent = '✅ ' + data.message;
     loadShifts();
+    loadSubscriptionStatus();
   } catch (err) {
     statusEl.textContent = '❌ ' + err.message;
   } finally {
@@ -231,13 +271,80 @@ async function loadStaff() {
   }
 }
 
+async function loadSubscriptionStatus() {
+  const statusEl = document.getElementById('planStatus');
+  const optionsEl = document.getElementById('planOptions');
+  const noteEl = document.getElementById('planNote');
+  try {
+    const res = await fetch('/api/subscription-status', { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '取得に失敗しました');
+
+    statusEl.className = 'planStatus';
+    if (data.subscribed) {
+      const planInfo = data.plans[data.subscriptionPlan];
+      const planLabel = planInfo ? planInfo.label : (data.subscriptionPlan || '有料プラン');
+      const until = data.currentPeriodEnd ? new Date(data.currentPeriodEnd).toLocaleDateString('ja-JP') : '';
+      statusEl.textContent = `✅ ${planLabel}をご利用中です（次回更新：${until}）`;
+      statusEl.classList.add('ok');
+      optionsEl.style.display = 'none';
+    } else if (data.inTrial) {
+      const until = new Date(data.trialEndsAt).toLocaleDateString('ja-JP');
+      statusEl.textContent = `🎁 無料期間中です（${until}まで、配信回数の制限はありません）`;
+      optionsEl.style.display = 'none';
+    } else if (data.freeRemaining > 0) {
+      statusEl.textContent = `今月の無料配信は残り${data.freeRemaining}回です（毎月${data.freeMonthlyBroadcasts}回まで無料）`;
+      optionsEl.style.display = data.stripeEnabled ? 'flex' : 'none';
+    } else {
+      statusEl.textContent = `今月の無料配信回数（${data.freeMonthlyBroadcasts}回）を超えました。プランをアップグレードすると引き続き配信できます。`;
+      statusEl.classList.add('warn');
+      optionsEl.style.display = data.stripeEnabled ? 'flex' : 'none';
+    }
+    noteEl.textContent = (!data.stripeEnabled && !data.subscribed && !data.inTrial)
+      ? '（現在オンライン決済の準備中です。詳しくは運営にお問い合わせください）'
+      : '';
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  }
+}
+
+async function startCheckout(plan) {
+  try {
+    const res = await fetch('/api/create-checkout-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ plan }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '決済ページの作成に失敗しました');
+    location.href = data.url;
+  } catch (err) {
+    alert('❌ ' + err.message);
+  }
+}
+
+function handleCheckoutRedirect() {
+  const params = new URLSearchParams(location.search);
+  const checkout = params.get('checkout');
+  if (checkout === 'success') {
+    alert('✅ お手続きありがとうございます。プランの反映まで少し時間がかかる場合があります。');
+  } else if (checkout === 'cancel') {
+    alert('決済手続きがキャンセルされました。');
+  }
+  if (checkout) {
+    history.replaceState({}, '', location.pathname);
+  }
+}
+
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+handleCheckoutRedirect();
 loadMe();
 loadShifts();
 loadStaff();
+loadSubscriptionStatus();
 </script>
 </body>
 </html>

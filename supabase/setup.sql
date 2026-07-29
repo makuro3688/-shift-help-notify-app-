@@ -7,7 +7,13 @@ create table if not exists stores (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   admin_key_hash text not null unique, -- 管理者キーのSHA-256ハッシュ。生のキーはDBに保存しない
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- 課金関連（trial=無料期間中 / active=有料プラン利用中 / past_due=支払い失敗 / canceled=解約済み）
+  subscription_status text not null default 'trial',
+  subscription_plan text, -- monthly | quarterly | yearly
+  stripe_customer_id text,
+  stripe_subscription_id text,
+  current_period_end timestamptz
 );
 
 -- スタッフの通知宛先（Push Subscription）
@@ -39,6 +45,12 @@ create table if not exists shifts (
 create table if not exists app_config (
   key text primary key,
   value text not null
+);
+
+-- Stripe Webhookから届くイベントを重複処理しないための記録テーブル
+create table if not exists stripe_events (
+  id text primary key, -- StripeのイベントID（evt_...）
+  received_at timestamptz not null default now()
 );
 
 -- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
