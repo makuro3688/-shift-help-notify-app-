@@ -249,7 +249,7 @@ async function main() {
       // APP_URLを明示指定していなければ、Renderが自動で用意するURLを使う
       const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
       const payload = JSON.stringify({
-        title: `🚨【急募】${storeName}`,
+        title: `Tasuel+ 🚨【急募】${storeName}`,
         body: `【日時】${date} ${time}${note ? '\n' + note : ''}\n先着1名です。タップして応募！`,
         url: `${baseUrl}/respond.html?id=${shiftId}`,
       });

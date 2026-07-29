@@ -3,13 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ヘルプ応募</title>
+<title>Tasuel+ ｜ ヘルプ応募</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; text-align: center; }
   .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 400px; margin: 40px auto; }
+  .brand { font-size: 12px; font-weight: 800; letter-spacing: 0.5px; color: #e74c3c; margin: 0 0 8px; }
   h2 { margin-top: 0; }
   .detail { text-align: left; background: #f8f9fb; padding: 14px; border-radius: 8px; margin: 16px 0; font-size: 14px; line-height: 1.7; }
-  input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; margin-top: 6px; font-family: inherit; }
+  input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; margin-top: 6px; font-family: inherit; background: white; }
   button { background: #27ae60; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
   button:disabled { background: #ccc; }
   .result { margin-top: 16px; font-size: 15px; font-weight: bold; }
@@ -42,6 +43,7 @@ async function init() {
 function render(shift) {
   if (shift.status === 'filled') {
     card.innerHTML = `
+      <p class="brand">Tasuel+</p>
       <h2>🙏 募集終了</h2>
       <div class="detail">
         <strong>${escapeHtml(shift.store_name)}</strong><br>
@@ -51,16 +53,25 @@ function render(shift) {
     `;
     return;
   }
+  const staffNames = shift.staffNames || [];
+  const nameField = staffNames.length
+    ? `<select id="name">
+        <option value="">選択してください</option>
+        ${staffNames.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}
+      </select>`
+    : `<p style="font-size:13px;color:#e74c3c;">この店舗に登録済みのスタッフがまだいません。先に通知登録画面でお名前を登録してください。</p>`;
+
   card.innerHTML = `
+    <p class="brand">Tasuel+</p>
     <h2>🚨 急募のヘルプ</h2>
     <div class="detail">
       <strong>${escapeHtml(shift.store_name)}</strong><br>
       ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
       ${shift.note ? '<br>' + escapeHtml(shift.note) : ''}
     </div>
-    <label style="font-size:13px;color:#555;">お名前</label>
-    <input id="name" placeholder="例：山田">
-    <button id="respondBtn" onclick="respond()">✋ このヘルプに入る</button>
+    <label style="font-size:13px;color:#555;">お名前（登録済みの一覧から選択）</label>
+    ${nameField}
+    <button id="respondBtn" onclick="respond()" ${staffNames.length ? '' : 'disabled'}>✋ このヘルプに入る</button>
     <div id="result" class="result"></div>
   `;
 }
@@ -68,7 +79,12 @@ function render(shift) {
 async function respond() {
   const btn = document.getElementById('respondBtn');
   const resultEl = document.getElementById('result');
-  const name = document.getElementById('name').value.trim();
+  const nameEl = document.getElementById('name');
+  const name = nameEl ? nameEl.value.trim() : '';
+  if (!name) {
+    resultEl.textContent = 'お名前を選択してください。';
+    return;
+  }
   btn.disabled = true;
   resultEl.textContent = '送信中...';
 
