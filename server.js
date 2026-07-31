@@ -33,10 +33,11 @@ const PLAN_LABELS = {
   yearly: { label: '年間プラン（50%OFF）', priceJPY: 5880, interval: '1年ごと' },
 };
 
-// 無料期間：店舗登録から1か月間は配信回数の制限なし
 const FREE_TRIAL_MONTHS = 1;
-// 無料期間終了後、毎月2回までは無料。3回目の配信からは有料プランが必要
 const FREE_MONTHLY_BROADCASTS = 2;
+const STORE_NAME_MAX_LENGTH = 50;
+const STAFF_NAME_MAX_LENGTH = 20;
+
 
 function trialEndsAt(store) {
   const end = new Date(store.created_at);
@@ -60,8 +61,6 @@ function planFromPriceId(priceId) {
   return null;
 }
 
-// その店舗が「今月すでに何回配信したか」をshiftsテーブルから数える
-// （専用カウンターテーブルを持たず、実績から毎回集計することで月替わりの処理を単純化している）
 async function getMonthlyBroadcastCount(storeId) {
   const now = new Date();
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
@@ -74,10 +73,6 @@ async function getMonthlyBroadcastCount(storeId) {
   return count || 0;
 }
 
-// 配信してよいかどうかを判定する。
-// 1. 登録から1か月以内 → 無条件で許可（無料期間）
-// 2. 有料プラン契約中（current_period_end内） → 許可
-// 3. それ以外 → 今月の配信回数が2回未満なら許可、2回以上なら要アップグレード
 async function checkBroadcastAllowed(store) {
   const now = new Date();
   if (now < trialEndsAt(store)) {
@@ -93,19 +88,32 @@ async function checkBroadcastAllowed(store) {
   return { allowed: true, reason: 'free_quota', countThisMonth };
 }
 
-// 店舗は「店舗名の文字列一致」ではなく、自動採番されるID(stores.id)で区別する。
-// これにより、別々の会社が同じ店舗名（例："牛久店"）を使っても内部的には別物として扱われ、
-// データが混ざることはない。
-// 管理者キーは店長が自己登録した際にランダム生成され、DBにはハッシュ値のみ保存する
-// （生の値はDBが漏れても使えない。ログイン時は同じ方法でハッシュ化して一致するものを検索する）。
 function generateAdminKey() {
-  return crypto.randomBytes(20).toString('hex'); // 40文字のランダムな文字列
+  return crypto.randomBytes(20).toString('hex');
 }
 function hashKey(key) {
   return crypto.createHash('sha256').update(key).digest('hex');
 }
 
-// shiftsテーブルの行(snake_case)をフロントエンドが期待する形に変換
+function findPersonalInfoIssue(value) {
+  const v = String(value || '');
+
+  const digitCount = (v.match(/\d/g) || []).length;
+  if (digitCount >= 4) {
+    return '電話番号や生年月日など、数字を含む個人情報は入力しないでください';
+  }
+
+  if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(v)) {
+    return 'メールアドレスは入力しないでください';
+  }
+
+  if (/(男性|女性|male|female)/i.test(v)) {
+    return '性別などの個人情報は入力しないでください';
+  }
+
+  return null;
+}
+
 function mapShift(row) {
   return {
     id: row.id,
@@ -132,9 +140,6 @@ async function setConfig(key, value) {
   if (error) throw error;
 }
 
-// --- VAPID鍵：初回のみ生成し、以後はSupabase(app_config)に保存して使い回す ---
-// ローカルファイルに保存する方式だとRenderの無料プランではスリープのたびに消えてしまうため、
-// 外部DBであるSupabaseに保存することで、サーバーが何度再起動・スリープしても鍵が変わらないようにする。
 async function loadOrCreateVapidKeys() {
   const [publicKey, privateKey] = await Promise.all([getConfig('vapid_public_key'), getConfig('vapid_private_key')]);
   if (publicKey && privateKey) return { publicKey, privateKey };
@@ -163,8 +168,6 @@ async function main() {
 
   app.use(cors());
 
-  // Stripe Webhookはリクエストボディの生データ（raw body）が必要なため、
-  // 全体にexpress.json()をかける前に、このルートだけ個別に登録する。
   app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
       return res.status(500).send('Stripe webhook is not configured');
@@ -178,10 +181,8 @@ async function main() {
     }
 
     try {
-      // 同じイベントを二重処理しないための簡易チェック
       const { error: dupCheckErr } = await supabase.from('stripe_events').insert({ id: event.id });
       if (dupCheckErr && dupCheckErr.code === '23505') {
-        // 既に処理済みのイベント（一意制約違反）
         return res.json({ received: true, duplicate: true });
       }
 
@@ -235,9 +236,6 @@ async function main() {
   app.use(express.json());
   app.use(express.static(path.join(__dirname, 'public')));
 
-  // 店長用エンドポイントの認証。管理者キーをハッシュ化し、一致する店舗をDBから探す。
-  // 見つかった店舗のIDを req.storeId に入れることで、店長は自分の店舗の情報しか
-  // 見えない・配信できない状態になる。課金判定に使う情報もあわせて req.store に入れる。
   async function requireAdmin(req, res, next) {
     const key = req.headers['x-admin-key'];
     if (!key) {
@@ -265,27 +263,25 @@ async function main() {
     }
   }
 
-  // 外形監視(UptimeRobot等)からの死活確認用。DBに触らず即応答するので軽い。
-  // Renderの無料プランは15分無アクセスでスリープするため、これを5〜10分おきにpingすると
-  // スリープを回避できる（月750時間の無料枠内に収まる想定。詳細はDEPLOY.md参照）。
   app.get('/health', (req, res) => {
     res.status(200).send('ok');
   });
 
-  // 公開鍵を配布するエンドポイント
   app.get('/api/vapid-public-key', (req, res) => {
     res.json({ publicKey: vapidKeys.publicKey });
   });
 
-  // 店長の自己登録：店舗名を入力するだけで新しい店舗が作られ、管理者キーが発行される。
-  // 管理者キーはこのレスポンスでしか平文を返さない（DBにはハッシュ値のみ保存）。
   app.post('/api/stores', async (req, res) => {
     const name = ((req.body && req.body.name) || '').trim();
     if (!name) {
       return res.status(400).json({ error: '店舗名を入力してください' });
     }
-    if (name.length > 100) {
-      return res.status(400).json({ error: '店舗名が長すぎます' });
+    if (name.length > STORE_NAME_MAX_LENGTH) {
+      return res.status(400).json({ error: `店舗名は${STORE_NAME_MAX_LENGTH}文字以内で入力してください` });
+    }
+    const personalInfoIssue = findPersonalInfoIssue(name);
+    if (personalInfoIssue) {
+      return res.status(400).json({ error: personalInfoIssue });
     }
     try {
       const adminKey = generateAdminKey();
@@ -303,8 +299,6 @@ async function main() {
     }
   });
 
-  // 店舗名を表示用に取得する（スタッフ登録画面が、リンク先の店舗名を確認するために使う）。
-  // 管理者キーなどの秘匿情報は一切含まない。
   app.get('/api/stores/:id', async (req, res) => {
     const { data, error } = await supabase.from('stores').select('id, name').eq('id', req.params.id).maybeSingle();
     if (error) {
@@ -315,12 +309,10 @@ async function main() {
     res.json({ id: data.id, name: data.name });
   });
 
-  // ログイン中の店長の店舗情報を返す（管理者キーに紐づく店舗）
   app.get('/api/me', requireAdmin, (req, res) => {
     res.json({ storeId: req.storeId, storeName: req.storeName });
   });
 
-  // 課金状況（無料期間・今月の残り無料回数・契約中プラン等）をダッシュボードに返す
   app.get('/api/subscription-status', requireAdmin, async (req, res) => {
     try {
       const store = req.store;
@@ -355,7 +347,6 @@ async function main() {
     }
   });
 
-  // アップグレード用のStripe Checkoutセッションを作成し、遷移先URLを返す
   app.post('/api/create-checkout-session', requireAdmin, async (req, res) => {
     if (!stripe) {
       return res.status(500).json({ error: '決済機能が設定されていません（管理者にお問い合わせください）' });
@@ -394,10 +385,6 @@ async function main() {
     }
   });
 
-  // スタッフの通知宛先(Subscription)を保存。どの店舗・誰の登録かも一緒に記録する。
-  // store_idは店長から配られたリンク/QRコードのURL(?store=店舗ID)から来るため、
-  // 店舗名が他店と被っていても間違った店舗に登録される心配がない。
-  // 名前は仮名で構わないが、応募時のなりすまし防止のため必須にしている。
   app.post('/api/subscribe', async (req, res) => {
     const { subscription, store_id, staff_name } = req.body || {};
     const name = (staff_name || '').trim();
@@ -409,6 +396,13 @@ async function main() {
     }
     if (!name) {
       return res.status(400).json({ error: 'お名前（仮名でも可）を入力してください' });
+    }
+    if (name.length > STAFF_NAME_MAX_LENGTH) {
+      return res.status(400).json({ error: `お名前は${STAFF_NAME_MAX_LENGTH}文字以内で入力してください` });
+    }
+    const personalInfoIssue = findPersonalInfoIssue(name);
+    if (personalInfoIssue) {
+      return res.status(400).json({ error: personalInfoIssue });
     }
     try {
       const { data: store, error: storeErr } = await supabase
@@ -432,7 +426,6 @@ async function main() {
           .insert({ endpoint: subscription.endpoint, subscription, store_id: store.id, store_name: store.name, staff_name: name });
         if (insErr) throw insErr;
       } else {
-        // 既に登録済みの端末が店舗や名前を選び直した場合は上書きする
         const { error: updErr } = await supabase
           .from('subscriptions')
           .update({ store_id: store.id, store_name: store.name, staff_name: name })
@@ -453,9 +446,6 @@ async function main() {
     }
   });
 
-  // 店長：ヘルプ募集を自分の店舗のスタッフに配信
-  // 店舗はリクエストボディからではなく、ログインに使った管理者キーから決まる。
-  // これにより、ある店舗のキーでログインした店長が他店舗へ誤配信することはできない。
   app.post('/api/send-broadcast', requireAdmin, async (req, res) => {
     const storeId = req.storeId;
     const storeName = req.storeName;
@@ -481,15 +471,13 @@ async function main() {
       if (insErr) throw insErr;
 
       const shiftId = shift.id;
-      // APP_URLを明示指定していなければ、Renderが自動で用意するURLを使う
       const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
       const payload = JSON.stringify({
-        title: `Tasuel+ 🚨【急募】${storeName}`,
+        title: `DAIDA+ 🚨【急募】${storeName}`,
         body: `【日時】${date} ${time}${note ? '\n' + note : ''}\n先着1名です。タップして応募！`,
         url: `${baseUrl}/respond.html?id=${shiftId}`,
       });
 
-      // 同じ店舗を選んで登録したスタッフだけに送る（他店舗には届かない）
       const { data: subs, error: subsErr } = await supabase
         .from('subscriptions')
         .select('*')
@@ -526,8 +514,6 @@ async function main() {
     }
   });
 
-  // スタッフ：募集の現在の状態を確認（respond.html用）
-  // 応募時になりすましを防ぐため、その店舗に登録済みのスタッフ名一覧も一緒に返す。
   app.get('/api/shift/:id', async (req, res) => {
     const { data, error } = await supabase.from('shifts').select('*').eq('id', req.params.id).maybeSingle();
     if (error) {
@@ -549,10 +535,6 @@ async function main() {
     res.json({ ...mapShift(data), staffNames });
   });
 
-  // スタッフ：先着順で応募する
-  // UPDATE ... WHERE status = 'open' を使うことで、複数人が同時に応募しても
-  // Postgres側で1件しか更新が成功しない（先着順が保証される）。
-  // 応募前に「その店舗に登録済みの名前かどうか」を確認し、なりすまし応募を防ぐ。
   app.post('/api/shift/:id/respond', async (req, res) => {
     try {
       const name = (req.body && req.body.name ? String(req.body.name) : '').trim();
@@ -595,7 +577,6 @@ async function main() {
         return res.json({ message: '応募が完了しました！ありがとうございます！', shift: mapShift(data) });
       }
 
-      // 更新が0件だった場合：応募している間にすでに他の人が埋めていた
       return res.status(409).json({ error: '残念、すでに他のスタッフが対応済みです', shift: mapShift(shift) });
     } catch (err) {
       console.error('respond error:', err);
@@ -603,7 +584,6 @@ async function main() {
     }
   });
 
-  // 店長：募集一覧（ダッシュボード用）。自分の店舗の分だけを返す。
   app.get('/api/shifts', requireAdmin, async (req, res) => {
     const { data, error } = await supabase
       .from('shifts')
@@ -617,7 +597,6 @@ async function main() {
     res.json((data || []).map(mapShift));
   });
 
-  // 店長：自分の店舗に登録済みのスタッフ一覧（誰が登録しているか確認できるように）
   app.get('/api/staff', requireAdmin, async (req, res) => {
     const { data, error } = await supabase
       .from('subscriptions')

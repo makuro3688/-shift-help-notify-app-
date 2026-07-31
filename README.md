@@ -1,4 +1,4 @@
-# Tasuel+（急な欠勤ヘルプ募集ボット）
+# DAIDA+（急な欠勤ヘルプ募集ボット）
 
 店長が「急な欠勤の穴埋め探し」にかけている時間をなくすための、LINEも個人情報も使わないPush通知アプリ。
 
@@ -50,7 +50,7 @@
 cd help-notify-app
 npm install
 cp .env.example .env
-# .envを開いて SUPABASE_URL・SUPABASE_SERVICE_KEY を設定する
+# .envを開いて SUPABASE_URL・SUPABASE_SERVICE_KEYを設定する
 npm start
 ```
 

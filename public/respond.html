@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Tasuel+ ｜ ヘルプ応募</title>
+<title>DAIDA+ ｜ ヘルプ応募</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; text-align: center; }
   .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 400px; margin: 40px auto; }
@@ -43,7 +43,7 @@ async function init() {
 function render(shift) {
   if (shift.status === 'filled') {
     card.innerHTML = `
-      <p class="brand">Tasuel+</p>
+      <p class="brand">DAIDA+</p>
       <h2>🙏 募集終了</h2>
       <div class="detail">
         <strong>${escapeHtml(shift.store_name)}</strong><br>
@@ -62,7 +62,7 @@ function render(shift) {
     : `<p style="font-size:13px;color:#e74c3c;">この店舗に登録済みのスタッフがまだいません。先に通知登録画面でお名前を登録してください。</p>`;
 
   card.innerHTML = `
-    <p class="brand">Tasuel+</p>
+    <p class="brand">DAIDA+</p>
     <h2>🚨 急募のヘルプ</h2>
     <div class="detail">
       <strong>${escapeHtml(shift.store_name)}</strong><br>
