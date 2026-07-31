@@ -15,6 +15,7 @@
   button { background: #00a8ff; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
   button:disabled { background: #b0c4d4; }
   .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; text-align: left; }
+  .hint { color: #9aa5ab; font-size: 12px; margin-top: 4px; text-align: left; }
   .status { margin-top: 16px; font-size: 14px; }
   .result { display: none; }
   .warn { background: #fff6e6; border: 1px solid #f5c96b; border-radius: 8px; padding: 14px; margin-top: 16px; font-size: 13px; text-align: left; line-height: 1.7; }
@@ -37,7 +38,8 @@
 
   <div id="formArea">
     <label>店舗名</label>
-    <input id="storeName" placeholder="例：〇〇店">
+    <input id="storeName" placeholder="例：〇〇店" maxlength="50">
+    <p class="hint">電話番号・住所・担当者の生年月日など、店舗名の趣旨に反する個人情報は入力しないでください。</p>
     <button id="submitBtn" onclick="createStore()">登録する</button>
     <div id="status" class="status"></div>
   </div>
@@ -75,6 +77,31 @@
 </div>
 
 <script>
+const STORE_NAME_MAX_LENGTH = 50;
+
+// 店舗名に、その項目の趣旨（店舗を識別する名称）に反する個人情報が
+// 入力されていないかを簡易チェックする。サーバー側（/api/stores）でも同じ内容を
+// 検証しているため、ここでの制限はユーザーへの早期フィードバック目的であり、
+// セキュリティ上の最終防衛はサーバー側にある。
+function findPersonalInfoIssue(value) {
+  const v = String(value || '');
+
+  const digitCount = (v.match(/\d/g) || []).length;
+  if (digitCount >= 4) {
+    return '電話番号や生年月日など、数字を含む個人情報は入力しないでください。';
+  }
+
+  if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(v)) {
+    return 'メールアドレスは入力しないでください。';
+  }
+
+  if (/(男性|女性|male|female)/i.test(v)) {
+    return '性別などの個人情報は入力しないでください。';
+  }
+
+  return null;
+}
+
 async function createStore() {
   const btn = document.getElementById('submitBtn');
   const statusEl = document.getElementById('status');
@@ -83,6 +110,16 @@ async function createStore() {
     statusEl.textContent = '店舗名を入力してください。';
     return;
   }
+  if (name.length > STORE_NAME_MAX_LENGTH) {
+    statusEl.textContent = `店舗名は${STORE_NAME_MAX_LENGTH}文字以内で入力してください。`;
+    return;
+  }
+  const personalInfoIssue = findPersonalInfoIssue(name);
+  if (personalInfoIssue) {
+    statusEl.textContent = personalInfoIssue;
+    return;
+  }
+
   btn.disabled = true;
   statusEl.textContent = '登録中...';
 

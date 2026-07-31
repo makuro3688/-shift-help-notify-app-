@@ -13,6 +13,7 @@
   button { background: #00a8ff; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
   button:disabled { background: #b0c4d4; }
   .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; }
+  .hint { color: #9aa5ab; font-size: 12px; margin-top: 4px; text-align: left; }
   .status { margin-top: 16px; font-size: 14px; }
 </style>
 </head>
@@ -25,7 +26,8 @@
 
   <div id="form" style="display:none;">
     <label>お名前（あだ名でも可）</label>
-    <input id="staffName" placeholder="例：やまだ">
+    <input id="staffName" placeholder="例：やまだ" maxlength="20">
+    <p class="hint">電話番号・生年月日・性別など、個人情報は入力しないでください。</p>
 
     <button id="registerBtn" onclick="enablePushNotification()">🔔 通知を許可して登録</button>
     <div id="status" class="status"></div>
@@ -38,9 +40,32 @@
 <script>
 const params = new URLSearchParams(location.search);
 const storeId = params.get('store');
+const STAFF_NAME_MAX_LENGTH = 20;
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
+}
+
+// お名前欄に、その項目の趣旨（呼び名）に反する個人情報が入力されていないかを簡易チェックする。
+// サーバー側（/api/subscribe）でも同じ内容を検証しているため、ここでの制限は
+// ユーザーへの早期フィードバック目的であり、セキュリティ上の最終防衛はサーバー側にある。
+function findPersonalInfoIssue(value) {
+  const v = String(value || '');
+
+  const digitCount = (v.match(/\d/g) || []).length;
+  if (digitCount >= 4) {
+    return '電話番号や生年月日など、数字を含む個人情報は入力しないでください。';
+  }
+
+  if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(v)) {
+    return 'メールアドレスは入力しないでください。';
+  }
+
+  if (/(男性|女性|male|female)/i.test(v)) {
+    return '性別などの個人情報は入力しないでください。';
+  }
+
+  return null;
 }
 
 async function loadStore() {
@@ -70,6 +95,17 @@ async function enablePushNotification() {
 
   if (!staffName) {
     setStatus('お名前（あだ名でも可）を入力してください。');
+    return;
+  }
+
+  if (staffName.length > STAFF_NAME_MAX_LENGTH) {
+    setStatus(`お名前は${STAFF_NAME_MAX_LENGTH}文字以内で入力してください。`);
+    return;
+  }
+
+  const personalInfoIssue = findPersonalInfoIssue(staffName);
+  if (personalInfoIssue) {
+    setStatus(personalInfoIssue);
     return;
   }
 
