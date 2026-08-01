@@ -16,6 +16,16 @@ create table if not exists stores (
   current_period_end timestamptz
 );
 
+-- 時間帯責任者用のサブ管理者キー。オーナー・店長が発行し、代理募集の配信のみ許可される
+-- 限定権限。スタッフ管理・料金確認・契約更新・プラン変更・解約はできない。
+create table if not exists supervisor_keys (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references stores(id) on delete cascade,
+  admin_key_hash text not null unique, -- 管理者キーのSHA-256ハッシュ。生のキーはDBに保存しない
+  label text, -- 「土曜夜担当」など、誰用のキーか分かるようにするための任意の名前
+  created_at timestamptz not null default now()
+);
+
 -- スタッフの通知宛先（Push Subscription）
 create table if not exists subscriptions (
   id uuid primary key default gen_random_uuid(),
