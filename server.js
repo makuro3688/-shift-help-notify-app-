@@ -613,7 +613,28 @@ async function main() {
   app.listen(PORT, () => console.log(`Server running: http://localhost:${PORT}`));
 }
 
-main().catch((err) => {
-  console.error('起動に失敗しました:', err);
-  process.exit(1);
-});
+// コンテナ起動直後は、システムクロックがまだNTP同期しきっていないことがあり、
+// SupabaseのJWT検証が「JWT issued at future」（PGRST303）で一時的に失敗することがある。
+// これはコード側の不具合ではなく起動タイミングの問題で、数秒待てば解消する。
+// main()がapp.listen()に到達する前（＝ルート未登録の段階）でしか失敗しないため、
+// 素朴にmain()を再実行しても副作用（二重登録等）は起きない。
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startWithRetry(retriesLeft = 5) {
+  try {
+    await main();
+  } catch (err) {
+    const isClockSkew = err && err.code === 'PGRST303';
+    if (isClockSkew && retriesLeft > 0) {
+      console.log(`⏳ 起動直後のクロック同期待ち（JWT issued at future）。3秒後に再試行します（残り${retriesLeft}回）`);
+      await sleep(3000);
+      return startWithRetry(retriesLeft - 1);
+    }
+    console.error('起動に失敗しました:', err);
+    process.exit(1);
+  }
+}
+
+startWithRetry();
