@@ -22,6 +22,7 @@
   .badge.open { background: #f39c12; }
   .badge.filled { background: #27ae60; }
   .refresh { font-size: 13px; color: #00a8ff; cursor: pointer; float: right; }
+  .logout { font-size: 12px; color: #999; cursor: pointer; float: right; }
   .linkbox { display: flex; gap: 8px; margin-top: 6px; }
   .linkbox input { font-size: 12px; padding: 8px; border: 1px solid #ddd; border-radius: 6px; }
   .linkbox button { width: auto; padding: 8px 12px; margin-top: 0; font-size: 13px; background: #00a8ff; }
@@ -49,9 +50,22 @@
 </head>
 <body>
 
+<div class="card" id="loginCard">
+  <p class="brand">DAIDA+</p>
+  <h2>🔑 店長ログイン</h2>
+  <p style="color:#7f8c8d; font-size:14px;">店舗登録時に発行された管理者キーを入力してください。</p>
+  <label>管理者キー</label>
+  <input id="adminKeyInput" type="text" placeholder="管理者キーを入力" autocomplete="off">
+  <button id="loginBtn" onclick="login()">ログイン</button>
+  <div id="loginStatus" class="status"></div>
+</div>
+
+<div id="dashboard" style="display:none;">
+
 <div class="card">
   <p class="brand">DAIDA+</p>
   <div id="storeBadge" class="store-badge">店舗を確認中...</div>
+  <span class="logout" onclick="logout()">別の管理者キーでログイン</span>
   <h2>🚨 急募を配信</h2>
   <label>日付</label>
   <input id="date" type="date">
@@ -136,34 +150,94 @@
   </div>
 </div>
 
+</div>
+
 <script>
-function getAdminKey() {
-  let key = localStorage.getItem('adminKey');
-  if (!key) {
-    key = prompt('管理者キーを入力してください（自分の店舗用のキー）');
-    if (key) localStorage.setItem('adminKey', key);
-  }
-  return key;
+function getStoredAdminKey() {
+  return localStorage.getItem('adminKey');
 }
 
 function authHeaders() {
-  return { 'x-admin-key': getAdminKey() };
+  return { 'x-admin-key': getStoredAdminKey() || '' };
+}
+
+function showLogin(message) {
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('loginCard').style.display = 'block';
+  document.getElementById('loginStatus').textContent = message || '';
+}
+
+function showDashboard() {
+  document.getElementById('loginCard').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+}
+
+function logout() {
+  localStorage.removeItem('adminKey');
+  document.getElementById('adminKeyInput').value = '';
+  showLogin('ログアウトしました。管理者キーを入力してください。');
+}
+
+function handleUnauthorized() {
+  localStorage.removeItem('adminKey');
+  showLogin('❌ 認証に失敗しました。管理者キーをご確認のうえ、再度入力してください。');
 }
 
 let currentStoreId = null;
 
+async function login() {
+  const input = document.getElementById('adminKeyInput');
+  const statusEl = document.getElementById('loginStatus');
+  const btn = document.getElementById('loginBtn');
+  const key = input.value.trim();
+  if (!key) {
+    statusEl.textContent = '管理者キーを入力してください。';
+    return;
+  }
+  btn.disabled = true;
+  statusEl.textContent = '確認中...';
+  localStorage.setItem('adminKey', key);
+
+  try {
+    const res = await fetch('/api/me', { headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      localStorage.removeItem('adminKey');
+      statusEl.textContent = '❌ ' + (data.error || '認証に失敗しました。管理者キーをご確認ください。');
+      return;
+    }
+    document.getElementById('storeBadge').textContent = '🏬 ' + data.storeName;
+    currentStoreId = data.storeId;
+    renderStaffLink();
+    showDashboard();
+    loadShifts();
+    loadStaff();
+    loadSubscriptionStatus();
+  } catch (err) {
+    statusEl.textContent = '❌ 通信に失敗しました。しばらくしてから再度お試しください。';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function loadMe() {
+  const key = getStoredAdminKey();
+  if (!key) {
+    showLogin();
+    return;
+  }
   const badge = document.getElementById('storeBadge');
   try {
     const res = await fetch('/api/me', { headers: authHeaders() });
     const data = await res.json();
     if (!res.ok) {
-      if (res.status === 401) localStorage.removeItem('adminKey');
-      throw new Error(data.error || '認証に失敗しました');
+      handleUnauthorized();
+      return;
     }
     badge.textContent = '🏬 ' + data.storeName;
     currentStoreId = data.storeId;
     renderStaffLink();
+    showDashboard();
   } catch (err) {
     badge.textContent = '❌ ' + err.message;
   }
@@ -207,7 +281,10 @@ async function sendBroadcast() {
     });
     const data = await res.json();
     if (!res.ok) {
-      if (res.status === 401) localStorage.removeItem('adminKey');
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
       if (res.status === 402) {
         statusEl.textContent = '💳 ' + data.error;
         loadSubscriptionStatus();
@@ -230,7 +307,13 @@ async function loadShifts() {
   try {
     const res = await fetch('/api/shifts', { headers: authHeaders() });
     const shifts = await res.json();
-    if (!res.ok) throw new Error(shifts.error || '取得に失敗しました');
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(shifts.error || '取得に失敗しました');
+    }
 
     if (!shifts.length) {
       listEl.textContent = 'まだ募集はありません。';
@@ -257,7 +340,13 @@ async function loadStaff() {
   try {
     const res = await fetch('/api/staff', { headers: authHeaders() });
     const staff = await res.json();
-    if (!res.ok) throw new Error(staff.error || '取得に失敗しました');
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(staff.error || '取得に失敗しました');
+    }
 
     if (!staff.length) {
       listEl.textContent = 'まだ登録スタッフはいません。';
@@ -278,7 +367,13 @@ async function loadSubscriptionStatus() {
   try {
     const res = await fetch('/api/subscription-status', { headers: authHeaders() });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '取得に失敗しました');
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(data.error || '取得に失敗しました');
+    }
 
     statusEl.className = 'planStatus';
     if (data.subscribed) {
@@ -340,11 +435,12 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+document.getElementById('adminKeyInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') login();
+});
+
 handleCheckoutRedirect();
 loadMe();
-loadShifts();
-loadStaff();
-loadSubscriptionStatus();
 </script>
 </body>
 </html>
