@@ -180,6 +180,11 @@
 // 作成/管理していると、意図しない店舗に自動で入ってしまうトラブルを防ぐため）。
 // 過去にログインした店舗の一覧だけを localStorage（daidaSavedKeys）に保存しておき、
 // ログイン画面で「どの店舗に入るか」を選べるようにする。
+//
+// ただし「オーナー・店長」キーは履歴に保存しない。時間帯責任者用の端末を共用している場合、
+// 一度でもオーナー・店長キーでログインした履歴が残っていると、時間帯責任者がクリック1回で
+// オーナー権限に昇格できてしまう（本来キーを知らなければアクセスできないはずの操作が
+// できてしまう）ため。オーナー・店長は毎回キーを入力してログインする。
 let currentAdminKey = null;
 let currentStoreId = null;
 let currentRole = null;
@@ -188,9 +193,16 @@ function authHeaders() {
   return { 'x-admin-key': currentAdminKey || '' };
 }
 
+// 万一、以前のバージョンでオーナー・店長キーが履歴に保存されてしまっていた場合に備えて、
+// 読み込み時に必ずオーナー・店長のエントリを取り除く（自動的にクリーンアップされる）。
 function getSavedKeys() {
   try {
-    return JSON.parse(localStorage.getItem('daidaSavedKeys') || '[]');
+    const raw = JSON.parse(localStorage.getItem('daidaSavedKeys') || '[]');
+    const cleaned = raw.filter((k) => k.role !== 'owner');
+    if (cleaned.length !== raw.length) {
+      setSavedKeys(cleaned);
+    }
+    return cleaned;
   } catch (err) {
     return [];
   }
@@ -201,8 +213,9 @@ function setSavedKeys(list) {
 }
 
 // ログイン成功時に、この店舗のキーを履歴の先頭に追加（同じキーが既にあれば更新）する。
-// 履歴は直近8件まで保持する。
+// オーナー・店長キーは履歴に残さない（上記コメント参照）。履歴は直近8件まで保持する。
 function upsertSavedKey(entry) {
+  if (entry.role === 'owner') return;
   const list = getSavedKeys().filter((k) => k.key !== entry.key);
   list.unshift(entry);
   setSavedKeys(list.slice(0, 8));
