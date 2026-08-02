@@ -53,6 +53,11 @@
 <div class="card" id="loginCard">
   <p class="brand">DAIDA+</p>
   <h2>🔑 店長ログイン</h2>
+  <div id="savedKeyWrap" style="display:none;">
+    <label style="margin-top:0;">ログイン履歴から選ぶ</label>
+    <div id="savedKeyList"></div>
+    <p class="guideSection" style="margin:18px 0 6px;">■ 別の管理者キーでログイン</p>
+  </div>
   <p style="color:#7f8c8d; font-size:14px;">店舗登録時に発行された管理者キーを入力してください。</p>
   <label>管理者キー</label>
   <input id="adminKeyInput" type="text" placeholder="管理者キーを入力" autocomplete="off">
@@ -170,18 +175,72 @@
 </div>
 
 <script>
-function getStoredAdminKey() {
-  return localStorage.getItem('adminKey');
-}
+// 管理者キーは「今開いているタブでログイン中のキー」としてJS変数だけに持たせ、
+// ページを開いた瞬間に前回のキーで勝手にログインすることはしない（同じPCで複数店舗を
+// 作成/管理していると、意図しない店舗に自動で入ってしまうトラブルを防ぐため）。
+// 過去にログインした店舗の一覧だけを localStorage（daidaSavedKeys）に保存しておき、
+// ログイン画面で「どの店舗に入るか」を選べるようにする。
+let currentAdminKey = null;
+let currentStoreId = null;
+let currentRole = null;
 
 function authHeaders() {
-  return { 'x-admin-key': getStoredAdminKey() || '' };
+  return { 'x-admin-key': currentAdminKey || '' };
+}
+
+function getSavedKeys() {
+  try {
+    return JSON.parse(localStorage.getItem('daidaSavedKeys') || '[]');
+  } catch (err) {
+    return [];
+  }
+}
+
+function setSavedKeys(list) {
+  localStorage.setItem('daidaSavedKeys', JSON.stringify(list));
+}
+
+// ログイン成功時に、この店舗のキーを履歴の先頭に追加（同じキーが既にあれば更新）する。
+// 履歴は直近8件まで保持する。
+function upsertSavedKey(entry) {
+  const list = getSavedKeys().filter((k) => k.key !== entry.key);
+  list.unshift(entry);
+  setSavedKeys(list.slice(0, 8));
+}
+
+function removeSavedKey(key) {
+  setSavedKeys(getSavedKeys().filter((k) => k.key !== key));
+  renderSavedKeyList();
+}
+
+function renderSavedKeyList() {
+  const list = getSavedKeys();
+  const wrap = document.getElementById('savedKeyWrap');
+  const listEl = document.getElementById('savedKeyList');
+  if (!list.length) {
+    wrap.style.display = 'none';
+    listEl.innerHTML = '';
+    return;
+  }
+  wrap.style.display = 'block';
+  listEl.innerHTML = list
+    .map(
+      (s) => `
+    <div class="staffRow" style="cursor:pointer;" onclick="loginWithSavedKey('${escapeHtml(s.key)}')">
+      🏬 ${escapeHtml(s.storeName)}
+      <span class="store-badge" style="margin-left:6px;${s.role === 'owner' ? '' : 'background:#f3e8ff;color:#7c3aed;'}">${s.role === 'owner' ? 'オーナー・店長' : '時間帯責任者'}</span>
+      <span class="logout" style="float:right;" onclick="event.stopPropagation(); removeSavedKey('${escapeHtml(s.key)}')">削除</span>
+    </div>
+  `
+    )
+    .join('');
 }
 
 function showLogin(message) {
   document.getElementById('dashboard').style.display = 'none';
   document.getElementById('loginCard').style.display = 'block';
   document.getElementById('loginStatus').textContent = message || '';
+  renderSavedKeyList();
 }
 
 function showDashboard() {
@@ -190,18 +249,21 @@ function showDashboard() {
 }
 
 function logout() {
-  localStorage.removeItem('adminKey');
+  currentAdminKey = null;
+  currentStoreId = null;
+  currentRole = null;
   document.getElementById('adminKeyInput').value = '';
-  showLogin('ログアウトしました。管理者キーを入力してください。');
+  showLogin('ログアウトしました。ログインする店舗を選ぶか、管理者キーを入力してください。');
 }
 
+// 認証エラー時：無効になったキー（例：失効した時間帯責任者キー）は履歴からも消しておく
 function handleUnauthorized() {
-  localStorage.removeItem('adminKey');
+  if (currentAdminKey) {
+    removeSavedKey(currentAdminKey);
+  }
+  currentAdminKey = null;
   showLogin('❌ 認証に失敗しました。管理者キーをご確認のうえ、再度入力してください。');
 }
-
-let currentStoreId = null;
-let currentRole = null;
 
 // ログイン中の役割に応じて、オーナー・店長専用のカード（ご利用プラン・登録スタッフ・
 // 時間帯責任者の管理）の表示/非表示を切り替える。時間帯責任者は代理募集の配信のみ行える。
@@ -214,75 +276,53 @@ function applyRoleVisibility() {
   document.getElementById('supervisorCard').style.display = isOwner ? 'block' : 'none';
 }
 
+async function doLogin(key, statusEl, btn) {
+  if (!key) {
+    if (statusEl) statusEl.textContent = '管理者キーを入力してください。';
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (statusEl) statusEl.textContent = '確認中...';
+
+  try {
+    const res = await fetch('/api/me', { headers: { 'x-admin-key': key } });
+    const data = await res.json();
+    if (!res.ok) {
+      removeSavedKey(key);
+      if (statusEl) statusEl.textContent = '❌ ' + (data.error || '認証に失敗しました。管理者キーをご確認ください。');
+      return;
+    }
+    currentAdminKey = key;
+    currentStoreId = data.storeId;
+    currentRole = data.role;
+    upsertSavedKey({ key, storeName: data.storeName, role: data.role });
+    document.getElementById('storeBadge').textContent = '🏬 ' + data.storeName;
+    renderStaffLink();
+    applyRoleVisibility();
+    showDashboard();
+    loadShifts();
+    if (currentRole === 'owner') {
+      loadStaff();
+      loadSubscriptionStatus();
+      loadSupervisors();
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = '❌ 通信に失敗しました。しばらくしてから再度お試しください。';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function login() {
   const input = document.getElementById('adminKeyInput');
   const statusEl = document.getElementById('loginStatus');
   const btn = document.getElementById('loginBtn');
-  const key = input.value.trim();
-  if (!key) {
-    statusEl.textContent = '管理者キーを入力してください。';
-    return;
-  }
-  btn.disabled = true;
-  statusEl.textContent = '確認中...';
-  localStorage.setItem('adminKey', key);
-
-  try {
-    const res = await fetch('/api/me', { headers: authHeaders() });
-    const data = await res.json();
-    if (!res.ok) {
-      localStorage.removeItem('adminKey');
-      statusEl.textContent = '❌ ' + (data.error || '認証に失敗しました。管理者キーをご確認ください。');
-      return;
-    }
-    document.getElementById('storeBadge').textContent = '🏬 ' + data.storeName;
-    currentStoreId = data.storeId;
-    currentRole = data.role;
-    renderStaffLink();
-    applyRoleVisibility();
-    showDashboard();
-    loadShifts();
-    if (currentRole === 'owner') {
-      loadStaff();
-      loadSubscriptionStatus();
-      loadSupervisors();
-    }
-  } catch (err) {
-    statusEl.textContent = '❌ 通信に失敗しました。しばらくしてから再度お試しください。';
-  } finally {
-    btn.disabled = false;
-  }
+  await doLogin(input.value.trim(), statusEl, btn);
 }
 
-async function loadMe() {
-  const key = getStoredAdminKey();
-  if (!key) {
-    showLogin();
-    return;
-  }
-  const badge = document.getElementById('storeBadge');
-  try {
-    const res = await fetch('/api/me', { headers: authHeaders() });
-    const data = await res.json();
-    if (!res.ok) {
-      handleUnauthorized();
-      return;
-    }
-    badge.textContent = '🏬 ' + data.storeName;
-    currentStoreId = data.storeId;
-    currentRole = data.role;
-    renderStaffLink();
-    applyRoleVisibility();
-    showDashboard();
-    loadShifts();
-    if (currentRole === 'owner') {
-      loadStaff();
-      loadSubscriptionStatus();
-      loadSupervisors();
-    }
-  } catch (err) {
-    badge.textContent = '❌ ' + err.message;
-  }
+async function loginWithSavedKey(key) {
+  const statusEl = document.getElementById('loginStatus');
+  await doLogin(key, statusEl, null);
 }
 
 function renderStaffLink() {
@@ -584,7 +624,7 @@ document.getElementById('adminKeyInput').addEventListener('keydown', (e) => {
 });
 
 handleCheckoutRedirect();
-loadMe();
+showLogin();
 </script>
 </body>
 </html>
