@@ -14,10 +14,11 @@
   input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 15px; font-family: inherit; background: white; }
   button { background: #00a8ff; color: white; border: none; padding: 16px; width: 100%; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 20px; }
   button:disabled { background: #b0c4d4; }
+  .linkBtn { background: none; color: #00a8ff; font-size: 13px; font-weight: normal; padding: 8px; margin-top: 8px; text-decoration: underline; }
   .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; text-align: left; }
   .hint { color: #9aa5ab; font-size: 12px; margin-top: 4px; text-align: left; }
   .status { margin-top: 16px; font-size: 14px; }
-  .result { display: none; }
+  .result, .codeArea { display: none; }
   .warn { background: #fff6e6; border: 1px solid #f5c96b; border-radius: 8px; padding: 14px; margin-top: 16px; font-size: 13px; text-align: left; line-height: 1.7; }
   .keybox { display: flex; gap: 8px; margin-top: 6px; }
   .keybox input { font-family: monospace; font-size: 13px; }
@@ -34,14 +35,26 @@
 <div class="card" id="card">
   <p class="brand">DAIDA+</p>
   <h2>🏬 店舗の新規登録</h2>
-  <p style="color:#7f8c8d; font-size:14px;">店舗名を入力するだけで、その場ですぐに使い始められます（他の店舗と店舗名が同じでも問題ありません）。</p>
 
   <div id="formArea">
+    <p style="color:#7f8c8d; font-size:14px;">店舗名とメールアドレスを入力してください。入力いただいたメールアドレス宛てに確認コードをお送りします（無料期間の使い回しを防ぐため、店舗登録には実際に受信できるメールアドレスの確認が必要です）。</p>
     <label>店舗名</label>
     <input id="storeName" placeholder="例：〇〇店" maxlength="50">
     <p class="hint">電話番号・住所・担当者の生年月日など、店舗名の趣旨に反する個人情報は入力しないでください。</p>
-    <button id="submitBtn" onclick="createStore()">登録する</button>
-    <div id="status" class="status"></div>
+    <label>メールアドレス</label>
+    <input id="storeEmail" type="email" placeholder="例：owner@example.com" autocomplete="email">
+    <button id="requestBtn" onclick="requestCode()">確認コードを送信</button>
+    <div id="requestStatus" class="status"></div>
+  </div>
+
+  <div id="codeArea" class="codeArea">
+    <p style="color:#7f8c8d; font-size:14px;" id="codeSentTo"></p>
+    <label>確認コード（6桁）</label>
+    <input id="codeInput" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code">
+    <button id="verifyBtn" onclick="verifyCode()">確認して登録する</button>
+    <button type="button" class="linkBtn" onclick="backToForm()">店舗名・メールアドレスを修正する</button>
+    <button type="button" class="linkBtn" onclick="requestCode(true)">コードを再送する</button>
+    <div id="verifyStatus" class="status"></div>
   </div>
 
   <div id="resultArea" class="result">
@@ -102,10 +115,18 @@ function findPersonalInfoIssue(value) {
   return null;
 }
 
-async function createStore() {
-  const btn = document.getElementById('submitBtn');
-  const statusEl = document.getElementById('status');
-  const name = document.getElementById('storeName').value.trim();
+let pendingName = '';
+let pendingEmail = '';
+
+async function requestCode(isResend) {
+  const btn = document.getElementById('requestBtn');
+  const verifyBtn = document.getElementById('verifyBtn');
+  const statusEl = document.getElementById('requestStatus');
+  const verifyStatusEl = document.getElementById('verifyStatus');
+
+  const name = isResend ? pendingName : document.getElementById('storeName').value.trim();
+  const email = isResend ? pendingEmail : document.getElementById('storeEmail').value.trim();
+
   if (!name) {
     statusEl.textContent = '店舗名を入力してください。';
     return;
@@ -119,18 +140,79 @@ async function createStore() {
     statusEl.textContent = personalInfoIssue;
     return;
   }
+  if (!email) {
+    statusEl.textContent = 'メールアドレスを入力してください。';
+    return;
+  }
 
-  btn.disabled = true;
-  statusEl.textContent = '登録中...';
+  if (isResend) {
+    verifyBtn.disabled = true;
+    verifyStatusEl.textContent = '再送中...';
+  } else {
+    btn.disabled = true;
+    statusEl.textContent = '送信中...';
+  }
 
   try {
-    const res = await fetch('/api/stores', {
+    const res = await fetch('/api/signup/request-code', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, email }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '登録に失敗しました');
+    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
+
+    pendingName = name;
+    pendingEmail = email;
+
+    document.getElementById('codeSentTo').textContent =
+      `${email} 宛てに確認コードを送信しました。メールに記載の6桁のコードを入力してください（届かない場合は迷惑メールフォルダもご確認ください）。`;
+    document.getElementById('formArea').style.display = 'none';
+    document.getElementById('codeArea').style.display = 'block';
+
+    if (isResend) {
+      verifyStatusEl.textContent = '✅ 再送しました。';
+    } else {
+      document.getElementById('codeInput').value = '';
+      statusEl.textContent = '';
+    }
+  } catch (err) {
+    if (isResend) {
+      verifyStatusEl.textContent = '❌ ' + err.message;
+    } else {
+      statusEl.textContent = '❌ ' + err.message;
+    }
+  } finally {
+    btn.disabled = false;
+    verifyBtn.disabled = false;
+  }
+}
+
+function backToForm() {
+  document.getElementById('codeArea').style.display = 'none';
+  document.getElementById('formArea').style.display = 'block';
+  document.getElementById('verifyStatus').textContent = '';
+}
+
+async function verifyCode() {
+  const btn = document.getElementById('verifyBtn');
+  const statusEl = document.getElementById('verifyStatus');
+  const code = document.getElementById('codeInput').value.trim();
+  if (!code) {
+    statusEl.textContent = '確認コードを入力してください。';
+    return;
+  }
+  btn.disabled = true;
+  statusEl.textContent = '確認中...';
+
+  try {
+    const res = await fetch('/api/signup/verify-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingEmail, code }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '確認に失敗しました');
 
     const origin = location.origin;
     const staffUrl = `${origin}/?store=${data.storeId}`;
@@ -140,7 +222,7 @@ async function createStore() {
     document.getElementById('managerUrlOut').value = managerUrl;
     document.getElementById('staffUrlOut').value = staffUrl;
 
-    document.getElementById('formArea').style.display = 'none';
+    document.getElementById('codeArea').style.display = 'none';
     document.getElementById('resultArea').style.display = 'block';
 
     new QRCode(document.getElementById('qrcode'), {

@@ -33,6 +33,15 @@ const PLAN_LABELS = {
   yearly: { label: '年間プラン（50%OFF）', priceJPY: 5880, interval: '1年ごと' },
 };
 
+// --- 店舗登録時のメール認証（Resend）関連の設定 ---
+// 店舗名を変えて何度も登録し直すだけで無料期間（1か月間配信し放題）を取り続けられてしまう
+// 悪用を防ぐため、実際に受信できるメールアドレスの確認コードを店舗作成の前に必須にしている。
+// RESEND_API_KEYが未設定の場合、店舗登録（確認コード送信）自体ができない。
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'DAIDA+ <onboarding@resend.dev>';
+const SIGNUP_CODE_TTL_MINUTES = 15;
+const SIGNUP_CODE_RESEND_COOLDOWN_SECONDS = 60;
+
 // 無料期間：店舗登録から1か月間は配信回数の制限なし
 const FREE_TRIAL_MONTHS = 1;
 // 無料期間終了後、毎月2回までは無料。3回目の配信からは有料プランが必要
@@ -44,7 +53,14 @@ const FREE_MONTHLY_BROADCASTS = 2;
 const STORE_NAME_MAX_LENGTH = 50;
 const STAFF_NAME_MAX_LENGTH = 20;
 
+// 同じメールアドレスで2店舗目以降を登録した場合は skip_free_trial が true になっており、
+// その場合は無料期間を「登録した瞬間に終わっている」ものとして扱う（＝最初から
+// 「毎月2回まで無料」の通常運用と同じ扱いになる）。店舗名を変えて無料期間だけを
+// 繰り返し取得する悪用を防ぐための仕組み。
 function trialEndsAt(store) {
+  if (store.skip_free_trial) {
+    return new Date(store.created_at);
+  }
   const end = new Date(store.created_at);
   end.setMonth(end.getMonth() + FREE_TRIAL_MONTHS);
   return end;
@@ -109,6 +125,42 @@ function generateAdminKey() {
 }
 function hashKey(key) {
   return crypto.createHash('sha256').update(key).digest('hex');
+}
+
+// 店舗登録時のメール確認用の6桁コードを生成する
+function generateSignupCode() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ''));
+}
+
+// Resend（https://resend.com）のAPIを使って確認コードのメールを送る。
+// SDKは使わず素朴にfetchで叩く（依存を増やさないため。Node18+のグローバルfetchを利用）。
+async function sendSignupCodeEmail(email, code) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: email,
+      subject: 'DAIDA+ 店舗登録の確認コード',
+      html: `
+        <p>DAIDA+の店舗登録ありがとうございます。</p>
+        <p>以下の確認コードを登録画面に入力してください（${SIGNUP_CODE_TTL_MINUTES}分間有効です）。</p>
+        <p style="font-size:28px; font-weight:bold; letter-spacing:4px;">${code}</p>
+        <p>心当たりがない場合は、このメールは破棄してください。</p>
+      `,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Resend API error: ${res.status} ${text}`);
+  }
 }
 
 // 店舗名・スタッフ名は「その項目の趣旨（店舗を識別する名称／人を呼ぶための名前）」以外の
@@ -315,7 +367,7 @@ async function main() {
       const { data: store, error } = await supabase
         .from('stores')
         .select(
-          'id, name, created_at, subscription_status, subscription_plan, stripe_customer_id, stripe_subscription_id, current_period_end'
+          'id, name, created_at, subscription_status, subscription_plan, stripe_customer_id, stripe_subscription_id, current_period_end, skip_free_trial'
         )
         .eq('id', storeId)
         .maybeSingle();
@@ -356,10 +408,13 @@ async function main() {
     res.json({ publicKey: vapidKeys.publicKey });
   });
 
-  // 店長の自己登録：店舗名を入力するだけで新しい店舗が作られ、管理者キーが発行される。
-  // 管理者キーはこのレスポンスでしか平文を返さない（DBにはハッシュ値のみ保存）。
-  app.post('/api/stores', async (req, res) => {
+  // 店長の自己登録 手順1：メールアドレス宛てに6桁の確認コードを送る。
+  // 店舗名を変えるだけで無料期間（1か月間配信し放題）を何度も取り直す悪用を防ぐため、
+  // 実際に受信できるメールアドレスの確認を店舗作成の前に必須にしている。
+  app.post('/api/signup/request-code', async (req, res) => {
     const name = ((req.body && req.body.name) || '').trim();
+    const email = ((req.body && req.body.email) || '').trim().toLowerCase();
+
     if (!name) {
       return res.status(400).json({ error: '店舗名を入力してください' });
     }
@@ -370,18 +425,101 @@ async function main() {
     if (personalInfoIssue) {
       return res.status(400).json({ error: personalInfoIssue });
     }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: '正しいメールアドレスを入力してください' });
+    }
+    if (!RESEND_API_KEY) {
+      return res.status(500).json({ error: 'メール認証機能が設定されていません（管理者にお問い合わせください）' });
+    }
+
     try {
+      // 直近60秒以内に同じメールへ送信済みなら、連打・スパム防止のため再送を待たせる
+      const { data: recent, error: recentErr } = await supabase
+        .from('pending_signups')
+        .select('created_at')
+        .eq('email', email)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (recentErr) throw recentErr;
+      if (recent && Date.now() - new Date(recent.created_at).getTime() < SIGNUP_CODE_RESEND_COOLDOWN_SECONDS * 1000) {
+        return res
+          .status(429)
+          .json({ error: '直前にコードを送信しています。1分ほど待ってから再度お試しください（メールが届かない場合は迷惑メールフォルダもご確認ください）' });
+      }
+
+      const code = generateSignupCode();
+      const expiresAt = new Date(Date.now() + SIGNUP_CODE_TTL_MINUTES * 60 * 1000).toISOString();
+
+      // 同じメールの古い未確認コードは無効化する
+      await supabase.from('pending_signups').delete().eq('email', email);
+
+      const { error: insErr } = await supabase
+        .from('pending_signups')
+        .insert({ email, name, code_hash: hashKey(code), expires_at: expiresAt });
+      if (insErr) throw insErr;
+
+      await sendSignupCodeEmail(email, code);
+
+      res.json({ message: `${email} 宛てに確認コードを送信しました。メールをご確認ください。` });
+    } catch (err) {
+      console.error('request-code error:', err);
+      res.status(500).json({ error: '確認コードの送信に失敗しました。しばらくしてから再度お試しください' });
+    }
+  });
+
+  // 店長の自己登録 手順2：受け取った確認コードを照合し、正しければ店舗を作成する。
+  // 管理者キーはこのレスポンスでしか平文を返さない（DBにはハッシュ値のみ保存）。
+  // 同じメールアドレスで既に店舗を作成済みの場合、2店舗目以降は1か月間の無料配信し放題
+  // 期間を付与しない（store名を変えて無料期間だけを取り続ける悪用を防ぐため）。
+  app.post('/api/signup/verify-code', async (req, res) => {
+    const email = ((req.body && req.body.email) || '').trim().toLowerCase();
+    const code = ((req.body && req.body.code) || '').trim();
+
+    if (!email || !code) {
+      return res.status(400).json({ error: 'メールアドレスと確認コードを入力してください' });
+    }
+
+    try {
+      const { data: pending, error: pendingErr } = await supabase
+        .from('pending_signups')
+        .select('*')
+        .eq('email', email)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (pendingErr) throw pendingErr;
+
+      if (!pending || pending.code_hash !== hashKey(code) || new Date(pending.expires_at) < new Date()) {
+        return res.status(400).json({ error: 'コードが正しくないか、有効期限が切れています。もう一度コードを送信してください' });
+      }
+
+      const { data: existingStore, error: existingErr } = await supabase
+        .from('stores')
+        .select('id')
+        .eq('email', email)
+        .limit(1)
+        .maybeSingle();
+      if (existingErr) throw existingErr;
+
       const adminKey = generateAdminKey();
       const { data: store, error } = await supabase
         .from('stores')
-        .insert({ name, admin_key_hash: hashKey(adminKey) })
+        .insert({
+          name: pending.name,
+          admin_key_hash: hashKey(adminKey),
+          email,
+          skip_free_trial: !!existingStore,
+        })
         .select()
         .single();
       if (error) throw error;
 
+      await supabase.from('pending_signups').delete().eq('id', pending.id);
+
       res.status(201).json({ storeId: store.id, storeName: store.name, adminKey });
     } catch (err) {
-      console.error('create store error:', err);
+      console.error('verify-code error:', err);
       res.status(500).json({ error: '店舗の作成に失敗しました' });
     }
   });

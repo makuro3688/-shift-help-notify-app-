@@ -13,7 +13,9 @@ create table if not exists stores (
   subscription_plan text, -- monthly | quarterly | yearly
   stripe_customer_id text,
   stripe_subscription_id text,
-  current_period_end timestamptz
+  current_period_end timestamptz,
+  email text, -- 店舗登録時に確認したメールアドレス（無料期間の使い回し防止・連絡用）
+  skip_free_trial boolean not null default false -- 同じメールで2店舗目以降を作った場合true。1か月間の無料配信し放題を与えない
 );
 
 -- 時間帯責任者用のサブ管理者キー。オーナー・店長が発行し、代理募集の配信のみ許可される
@@ -23,6 +25,17 @@ create table if not exists supervisor_keys (
   store_id uuid not null references stores(id) on delete cascade,
   admin_key_hash text not null unique, -- 管理者キーのSHA-256ハッシュ。生のキーはDBに保存しない
   label text, -- 「土曜夜担当」など、誰用のキーか分かるようにするための任意の名前
+  created_at timestamptz not null default now()
+);
+
+-- 店舗登録時のメール認証用の一時テーブル。確認コードを送ってから店舗を作成するまでの間だけ使う。
+-- 認証済みで店舗作成が完了したら該当行は削除する。expires_atを過ぎた行は無効。
+create table if not exists pending_signups (
+  id uuid primary key default gen_random_uuid(),
+  email text not null,
+  name text not null,
+  code_hash text not null, -- 6桁確認コードのSHA-256ハッシュ。生のコードはDBに保存しない
+  expires_at timestamptz not null,
   created_at timestamptz not null default now()
 );
 
