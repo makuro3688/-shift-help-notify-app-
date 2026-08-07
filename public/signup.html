@@ -28,6 +28,10 @@
   .linkbox button { width: auto; padding: 10px 14px; margin-top: 0; font-size: 13px; }
   #qrcode { margin: 16px auto 0; width: 200px; }
   .section { margin-top: 24px; padding-top: 20px; border-top: 1px solid #eee; text-align: left; }
+  .consentNote { font-size: 12px; color: #888; margin-top: 12px; line-height: 1.6; text-align: left; }
+  .consentNote a { color: #00a8ff; }
+  .siteFooter { max-width: 460px; margin: 16px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
+  .siteFooter a { color: #888; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -43,6 +47,9 @@
     <p class="hint">電話番号・住所・担当者の生年月日など、店舗名の趣旨に反する個人情報は入力しないでください。</p>
     <label>メールアドレス</label>
     <input id="storeEmail" type="email" placeholder="例：owner@example.com" autocomplete="email">
+    <p class="consentNote">
+      登録することで、<a href="https://daida-store.jp/terms" target="_blank" rel="noopener">利用規約</a>および<a href="https://daida-store.jp/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>に同意したものとみなされます。
+    </p>
     <button id="requestBtn" onclick="requestCode()">確認コードを送信</button>
     <div id="requestStatus" class="status"></div>
   </div>
@@ -59,7 +66,8 @@
 
   <div id="resultArea" class="result">
     <div class="warn">
-      ⚠️ 下の「管理者キー」は<strong>この画面を閉じると二度と表示されません。</strong>必ずコピーしてメモや社内共有ツールなどに保存してください。このキーが店長用ダッシュボードのログインパスワードになります。
+      ⚠️ 下の「管理者キー」は<strong>この画面を閉じると二度と表示されません。</strong>必ずコピーして安全な場所に保存してください。このキーが店長用ダッシュボードのログインパスワードになります。<br><br>
+      <strong>このキーはオーナーご本人のみが保管してください。</strong>他の方に代理募集の配信を任せる場合は、店長用ダッシュボードの「時間帯責任者の管理」から時間帯責任者キーを発行してお渡しください（利用規約第4条2項により、アカウント＝管理者キーの共有は禁止されています）。
     </div>
 
     <div class="section">
@@ -88,6 +96,14 @@
     </div>
   </div>
 </div>
+
+<footer class="siteFooter">
+  <a href="https://daida-store.jp/terms" target="_blank" rel="noopener">利用規約</a>
+  ｜
+  <a href="https://daida-store.jp/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>
+  ｜
+  <a href="https://daida-store.jp/tokushoho" target="_blank" rel="noopener">特定商取引法に基づく表記</a>
+</footer>
 
 <script>
 const STORE_NAME_MAX_LENGTH = 50;

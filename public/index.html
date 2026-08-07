@@ -15,6 +15,14 @@
   .note { color: #7f8c8d; font-size: 13px; margin-top: 16px; line-height: 1.6; }
   .hint { color: #9aa5ab; font-size: 12px; margin-top: 4px; text-align: left; }
   .status { margin-top: 16px; font-size: 14px; }
+  .consentNote { font-size: 12px; color: #888; margin-top: 12px; line-height: 1.6; text-align: left; }
+  .consentNote a { color: #00a8ff; }
+  .siteFooter { max-width: 400px; margin: 16px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
+  .siteFooter a { color: #888; text-decoration: underline; }
+  .subLink { display: block; margin-top: 18px; font-size: 12px; color: #999; text-decoration: underline; cursor: pointer; }
+  .reportBox { margin-top: 10px; text-align: left; background: #f8f9fb; border-radius: 8px; padding: 12px; display: none; }
+  .reportBox textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px; font-family: inherit; margin-top: 6px; }
+  .reportBox button { padding: 10px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -29,13 +37,37 @@
     <input id="staffName" placeholder="例：やまだ" maxlength="20">
     <p class="hint">電話番号・生年月日・性別など、個人情報は入力しないでください。</p>
 
+    <p class="consentNote">
+      登録することで、<a href="https://daida-store.jp/terms" target="_blank" rel="noopener">利用規約</a>および<a href="https://daida-store.jp/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>に同意したものとみなされます。
+    </p>
     <button id="registerBtn" onclick="enablePushNotification()">🔔 通知を許可して登録</button>
     <div id="status" class="status"></div>
     <p class="note">
       iPhoneの方へ：Safariで開いた後、共有ボタン→「ホーム画面に追加」してから、ホーム画面のアイコンで開いて登録してください（Safariのタブのままだと通知が許可できません）。
     </p>
+
+    <span class="subLink" id="unsubscribeLink" onclick="unsubscribe()">🔕 この端末の通知登録を解除する（退会）</span>
+    <div id="unsubscribeStatus" class="status"></div>
+
+    <span class="subLink" id="reportToggleLink" onclick="toggleReportBox()">🚩 通報する</span>
+    <div id="reportBox" class="reportBox">
+      <label style="margin-top:0;">通報対象</label>
+      <input id="reportTarget" placeholder="例：〇〇さんの投稿について" maxlength="100">
+      <label>通報内容</label>
+      <textarea id="reportContent" rows="3" placeholder="具体的な内容をご記入ください" maxlength="1000"></textarea>
+      <button id="reportSubmitBtn" onclick="submitReport()" style="background:#888;">送信する</button>
+      <div id="reportStatus" class="status"></div>
+    </div>
   </div>
 </div>
+
+<footer class="siteFooter">
+  <a href="https://daida-store.jp/terms" target="_blank" rel="noopener">利用規約</a>
+  ｜
+  <a href="https://daida-store.jp/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>
+  ｜
+  <a href="https://daida-store.jp/tokushoho" target="_blank" rel="noopener">特定商取引法に基づく表記</a>
+</footer>
 
 <script>
 const params = new URLSearchParams(location.search);
@@ -144,6 +176,81 @@ async function enablePushNotification() {
   } catch (err) {
     console.error(err);
     setStatus('登録中にエラーが発生しました：' + err.message);
+    btn.disabled = false;
+  }
+}
+
+// 通知登録の解除（利用規約 第17条1項「いつでも退会することができます」対応）。
+// この端末のPush Subscriptionのendpointを特定し、サーバー側の該当行を1件削除する。
+// endpointはブラウザが発行する推測不可能な識別子なので、これだけで本人の登録だと特定できる。
+// 過去の応募履歴（shifts.filled_by）はそのまま残る（勤務実績の記録として必要なため）。
+async function unsubscribe() {
+  const statusEl = document.getElementById('unsubscribeStatus');
+  if (!('serviceWorker' in navigator)) {
+    statusEl.textContent = 'このブラウザでは通知登録の解除操作に対応していません。';
+    return;
+  }
+  if (!confirm('この端末の通知登録を解除しますか？以後、代理募集の通知は届かなくなります。')) {
+    return;
+  }
+  statusEl.textContent = '解除処理中...';
+  try {
+    const registration = await navigator.serviceWorker.getRegistration('/sw.js');
+    const subscription = registration ? await registration.pushManager.getSubscription() : null;
+    if (!subscription) {
+      statusEl.textContent = 'この端末に有効な通知登録が見つかりませんでした。';
+      return;
+    }
+    const res = await fetch('/api/subscribe', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: subscription.endpoint }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '解除に失敗しました');
+    await subscription.unsubscribe();
+    statusEl.textContent = '✅ ' + data.message;
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  }
+}
+
+function toggleReportBox() {
+  const box = document.getElementById('reportBox');
+  box.style.display = box.style.display === 'block' ? 'none' : 'block';
+}
+
+// 通報の送信（利用規約 第13条）。スタッフは管理者キーを持たないため認証なしで呼べる。
+// 第13条3項の規定により、送信後は受付完了の表示のみを行い、調査状況は返さない。
+async function submitReport() {
+  const targetInput = document.getElementById('reportTarget');
+  const contentInput = document.getElementById('reportContent');
+  const statusEl = document.getElementById('reportStatus');
+  const btn = document.getElementById('reportSubmitBtn');
+
+  const target = targetInput.value.trim();
+  const content = contentInput.value.trim();
+  if (!target || !content) {
+    statusEl.textContent = '通報対象と内容の両方を入力してください。';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '送信中...';
+  try {
+    const res = await fetch('/api/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ store_id: storeId, target, content }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
+    statusEl.textContent = '✅ ' + data.message;
+    targetInput.value = '';
+    contentInput.value = '';
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
     btn.disabled = false;
   }
 }

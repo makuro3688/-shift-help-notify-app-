@@ -46,6 +46,17 @@
   .planPrice span { font-size: 12px; font-weight: normal; color: #888; margin-left: 2px; }
   .planOption button { margin-top: 10px; padding: 10px; font-size: 14px; background: #00a8ff; }
   .planNote { font-size: 12px; color: #888; margin-top: 10px; }
+  .legalNotice { font-size: 13px; color: #333; line-height: 1.7; background: #fff6e6; border: 1px solid #f5c96b; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  .legalNotice a { color: #00639b; font-weight: bold; }
+  .withdrawCard { border: 1px solid #f5c6c6; }
+  .withdrawWarn { font-size: 13px; color: #8a2e2e; line-height: 1.7; background: #fdecec; border-radius: 8px; padding: 12px 14px; }
+  .withdrawBtn { background: #b02a2a; }
+  .noteBox { font-size: 12px; color: #8a5a00; background: #fff6e6; padding: 8px 10px; border-radius: 6px; margin-top: 8px; }
+  .consentNote { font-size: 12px; color: #888; margin-top: 10px; line-height: 1.6; }
+  .consentNote a { color: #00639b; }
+  .siteFooter { max-width: 480px; margin: 20px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
+  .siteFooter a { color: #888; text-decoration: underline; }
+  .reportLink { display: inline-block; margin-top: 10px; font-size: 13px; color: #888; cursor: pointer; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -86,21 +97,27 @@
 <div class="card" id="planCard">
   <h2>💳 ご利用プラン</h2>
   <div id="planStatus" class="planStatus">読み込み中...</div>
-  <div id="planOptions" class="planGrid" style="display:none;">
-    <div class="planOption">
-      <div class="planName">月額プラン</div>
-      <div class="planPrice">980円<span>/1か月</span></div>
-      <button onclick="startCheckout('monthly')">このプランにする</button>
+  <div id="planPurchaseArea" style="display:none;">
+    <div class="legalNotice">
+      ※ 有料プランは自動更新（定期課金）です。解約をご希望の場合は、次回更新日の前日までに下の「解約・支払い方法の変更」からお手続きください。<br>
+      <a href="https://daida-store.jp/tokushoho" target="_blank" rel="noopener">特定商取引法に基づく表記</a>
     </div>
-    <div class="planOption">
-      <div class="planName">3か月プラン<span class="planOff">20%OFF</span></div>
-      <div class="planPrice">2,352円<span>/3か月</span></div>
-      <button onclick="startCheckout('quarterly')">このプランにする</button>
-    </div>
-    <div class="planOption">
-      <div class="planName">年間プラン<span class="planOff">50%OFF</span></div>
-      <div class="planPrice">5,880円<span>/1年</span></div>
-      <button onclick="startCheckout('yearly')">このプランにする</button>
+    <div id="planOptions" class="planGrid">
+      <div class="planOption">
+        <div class="planName">月額プラン</div>
+        <div class="planPrice">980円<span>/1か月</span></div>
+        <button onclick="startCheckout('monthly')">このプランにする</button>
+      </div>
+      <div class="planOption">
+        <div class="planName">3か月プラン<span class="planOff">20%OFF</span></div>
+        <div class="planPrice">2,352円<span>/3か月</span></div>
+        <button onclick="startCheckout('quarterly')">このプランにする</button>
+      </div>
+      <div class="planOption">
+        <div class="planName">年間プラン<span class="planOff">50%OFF</span></div>
+        <div class="planPrice">5,880円<span>/1年</span></div>
+        <button onclick="startCheckout('yearly')">このプランにする</button>
+      </div>
     </div>
   </div>
   <p id="planNote" class="planNote"></p>
@@ -121,6 +138,7 @@
 <div class="card" id="supervisorCard">
   <h2>👥 時間帯責任者の管理</h2>
   <p style="font-size:13px;color:#555;margin-top:-8px;">代理募集の配信だけができる限定キーを発行できます。スタッフ管理・料金確認・契約変更はできません。</p>
+  <p class="noteBox">⚠️ オーナー・店長用の管理者キーは、ご本人以外と共有しないでください。他の方に代理募集の配信を任せたい場合は、必ずここから時間帯責任者キーを発行してお渡しください。</p>
   <label>ラベル（任意・例：土曜夜担当）</label>
   <input id="supervisorLabel" placeholder="例：土曜夜担当" maxlength="30">
   <button id="issueSupervisorBtn" onclick="issueSupervisor()">新しいキーを発行</button>
@@ -172,7 +190,38 @@
   </div>
 </div>
 
+<div class="card" id="reportCard">
+  <h2>🚩 通報</h2>
+  <p style="font-size:13px;color:#555;margin-top:-8px;">不適切な利用など、運営に確認してほしい内容があればこちらから通報できます。調査状況等は個別にはご案内できませんが、内容は必ず確認いたします。</p>
+  <label>通報対象（例：スタッフの名前、募集の日時など）</label>
+  <input id="reportTarget" placeholder="例：2026/08/10の急募について" maxlength="100">
+  <label>通報内容</label>
+  <textarea id="reportContent" rows="3" placeholder="具体的な内容をご記入ください" maxlength="1000"></textarea>
+  <button id="reportSubmitBtn" onclick="submitReport()" style="background:#555;">通報を送信する</button>
+  <div id="reportStatus" class="status"></div>
 </div>
+
+<div class="card withdrawCard" id="withdrawCard">
+  <h2>⚠️ 店舗の退会</h2>
+  <div class="withdrawWarn">
+    退会すると、この店舗の登録スタッフ・募集履歴・時間帯責任者キーなど<strong>すべてのデータが失われ、元に戻すことはできません。</strong><br>
+    有料プランをご契約中の場合は、退会と同時に自動更新（定期課金）も即時解約されます。
+  </div>
+  <label>確認のため、店舗名「<span id="withdrawStoreNameHint"></span>」を入力してください</label>
+  <input id="withdrawConfirmInput" placeholder="店舗名を入力">
+  <button id="withdrawBtn" class="withdrawBtn" onclick="withdrawStore()">退会する（元に戻せません）</button>
+  <div id="withdrawStatus" class="status"></div>
+</div>
+
+</div>
+
+<footer class="siteFooter">
+  <a href="https://daida-store.jp/terms" target="_blank" rel="noopener">利用規約</a>
+  ｜
+  <a href="https://daida-store.jp/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>
+  ｜
+  <a href="https://daida-store.jp/tokushoho" target="_blank" rel="noopener">特定商取引法に基づく表記</a>
+</footer>
 
 <script>
 // 管理者キーは「今開いているタブでログイン中のキー」としてJS変数だけに持たせ、
@@ -187,6 +236,7 @@
 // できてしまう）ため。オーナー・店長は毎回キーを入力してログインする。
 let currentAdminKey = null;
 let currentStoreId = null;
+let currentStoreName = null;
 let currentRole = null;
 
 function authHeaders() {
@@ -264,6 +314,7 @@ function showDashboard() {
 function logout() {
   currentAdminKey = null;
   currentStoreId = null;
+  currentStoreName = null;
   currentRole = null;
   document.getElementById('adminKeyInput').value = '';
   showLogin('ログアウトしました。ログインする店舗を選ぶか、管理者キーを入力してください。');
@@ -279,7 +330,9 @@ function handleUnauthorized() {
 }
 
 // ログイン中の役割に応じて、オーナー・店長専用のカード（ご利用プラン・登録スタッフ・
-// 時間帯責任者の管理）の表示/非表示を切り替える。時間帯責任者は代理募集の配信のみ行える。
+// 時間帯責任者の管理・店舗の退会）の表示/非表示を切り替える。時間帯責任者は代理募集の配信のみ行える。
+// 退会（withdrawCard）はE項（認可）のとおり、UI上もオーナー・店長にしか表示しない
+// （サーバー側もrequireOwnerで強制しており、UIの非表示はあくまで補助）。
 function applyRoleVisibility() {
   const isOwner = currentRole === 'owner';
   const roleBadge = document.getElementById('roleBadge');
@@ -287,6 +340,10 @@ function applyRoleVisibility() {
   document.getElementById('planCard').style.display = isOwner ? 'block' : 'none';
   document.getElementById('staffCard').style.display = isOwner ? 'block' : 'none';
   document.getElementById('supervisorCard').style.display = isOwner ? 'block' : 'none';
+  document.getElementById('withdrawCard').style.display = isOwner ? 'block' : 'none';
+  if (isOwner) {
+    document.getElementById('withdrawStoreNameHint').textContent = currentStoreName || '';
+  }
 }
 
 async function doLogin(key, statusEl, btn) {
@@ -307,6 +364,7 @@ async function doLogin(key, statusEl, btn) {
     }
     currentAdminKey = key;
     currentStoreId = data.storeId;
+    currentStoreName = data.storeName;
     currentRole = data.role;
     upsertSavedKey({ key, storeName: data.storeName, role: data.role });
     document.getElementById('storeBadge').textContent = '🏬 ' + data.storeName;
@@ -557,9 +615,90 @@ async function openBillingPortal() {
   }
 }
 
+// 店舗の退会（利用規約 第17条1項）。誤操作防止(D項)のため、店舗名の入力一致を
+// クライアント側でも確認してからAPIを呼ぶ（サーバー側でも同じ検証を必ず行っている）。
+// store_idはこの画面からは一切送らない。サーバー側がログイン中の管理者キーから
+// 自店舗のIDを特定するため、他店舗を指定して削除することはできない。
+async function withdrawStore() {
+  const input = document.getElementById('withdrawConfirmInput');
+  const statusEl = document.getElementById('withdrawStatus');
+  const btn = document.getElementById('withdrawBtn');
+  const confirmStoreName = input.value.trim();
+
+  if (!confirmStoreName || confirmStoreName !== currentStoreName) {
+    statusEl.textContent = '❌ 店舗名の入力が一致しません。正確に入力してください。';
+    return;
+  }
+  if (!confirm('本当に退会しますか？この操作は取り消せません。スタッフ登録・募集履歴などすべてのデータが削除されます。')) {
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '退会処理中...';
+  try {
+    const res = await fetch('/api/withdraw', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ confirmStoreName }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(data.error || '退会処理に失敗しました');
+    }
+    alert('✅ ' + data.message);
+    // 退会が完了したので、この端末に保存されている当該店舗のキーも消してログイン画面に戻す
+    removeSavedKey(currentAdminKey);
+    logout();
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 通報の送信（利用規約 第13条）。管理者キーなしでも呼べるAPIだが、店長画面からは
+// ログイン中の店舗IDを一緒に送ることで、どの店舗に関する通報かを紐付ける。
+async function submitReport() {
+  const targetInput = document.getElementById('reportTarget');
+  const contentInput = document.getElementById('reportContent');
+  const statusEl = document.getElementById('reportStatus');
+  const btn = document.getElementById('reportSubmitBtn');
+
+  const target = targetInput.value.trim();
+  const content = contentInput.value.trim();
+  if (!target || !content) {
+    statusEl.textContent = '通報対象と内容の両方を入力してください。';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '送信中...';
+  try {
+    const res = await fetch('/api/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ store_id: currentStoreId, target, content, reporter: currentStoreName || '' }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
+    statusEl.textContent = '✅ ' + data.message;
+    targetInput.value = '';
+    contentInput.value = '';
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function loadSubscriptionStatus() {
   const statusEl = document.getElementById('planStatus');
-  const optionsEl = document.getElementById('planOptions');
+  // プラン選択ボタン群と、その直上の「自動更新・特商法表記」の注記(H-1)をまとめて表示/非表示する
+  const optionsEl = document.getElementById('planPurchaseArea');
   const noteEl = document.getElementById('planNote');
   try {
     const res = await fetch('/api/subscription-status', { headers: authHeaders() });
@@ -586,11 +725,11 @@ async function loadSubscriptionStatus() {
       optionsEl.style.display = 'none';
     } else if (data.freeRemaining > 0) {
       statusEl.textContent = `今月の無料配信は残り${data.freeRemaining}回です（毎月${data.freeMonthlyBroadcasts}回まで無料）`;
-      optionsEl.style.display = data.stripeEnabled ? 'flex' : 'none';
+      optionsEl.style.display = data.stripeEnabled ? 'block' : 'none';
     } else {
       statusEl.textContent = `今月の無料配信回数（${data.freeMonthlyBroadcasts}回）を超えました。プランをアップグレードすると引き続き配信できます。`;
       statusEl.classList.add('warn');
-      optionsEl.style.display = data.stripeEnabled ? 'flex' : 'none';
+      optionsEl.style.display = data.stripeEnabled ? 'block' : 'none';
     }
     noteEl.textContent = (!data.stripeEnabled && !data.subscribed && !data.inTrial)
       ? '（現在オンライン決済の準備中です。詳しくは運営にお問い合わせください）'

@@ -16,15 +16,32 @@
   .result { margin-top: 16px; font-size: 15px; font-weight: bold; }
   .filled { color: #e74c3c; }
   .ok { color: #27ae60; }
+  .siteFooter { max-width: 400px; margin: 16px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
+  .siteFooter a { color: #888; text-decoration: underline; }
+  .subLink { display: block; margin-top: 16px; font-size: 12px; color: #999; text-decoration: underline; cursor: pointer; }
+  .reportBox { margin-top: 10px; text-align: left; background: #f8f9fb; border-radius: 8px; padding: 12px; display: none; }
+  .reportBox label { display: block; font-size: 13px; color: #555; margin-top: 6px; }
+  .reportBox textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px; font-family: inherit; margin-top: 6px; }
+  .reportBox button { padding: 10px; font-size: 13px; width: 100%; margin-top: 10px; background: #888; }
+  .status { margin-top: 10px; font-size: 13px; }
 </style>
 </head>
 <body>
 <div class="card" id="card">読み込み中...</div>
 
+<footer class="siteFooter">
+  <a href="https://daida-store.jp/terms" target="_blank" rel="noopener">利用規約</a>
+  ｜
+  <a href="https://daida-store.jp/privacy" target="_blank" rel="noopener">プライバシーポリシー</a>
+  ｜
+  <a href="https://daida-store.jp/tokushoho" target="_blank" rel="noopener">特定商取引法に基づく表記</a>
+</footer>
+
 <script>
 const params = new URLSearchParams(location.search);
 const shiftId = params.get('id');
 const card = document.getElementById('card');
+let currentStoreId = null; // 通報API送信用。読み込んだ募集からstore_idを保持しておく
 
 async function init() {
   if (!shiftId) {
@@ -40,7 +57,24 @@ async function init() {
   render(shift);
 }
 
+// 通報導線（利用規約 第13条）のHTML。募集が埋まった後の画面・応募前の画面どちらにも表示する。
+function reportSectionHtml() {
+  return `
+    <span class="subLink" id="reportToggleLink" onclick="toggleReportBox()">🚩 通報する</span>
+    <div id="reportBox" class="reportBox">
+      <label>通報対象</label>
+      <input id="reportTarget" placeholder="例：この募集について" maxlength="100" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;box-sizing:border-box;font-size:13px;">
+      <label>通報内容</label>
+      <textarea id="reportContent" rows="3" placeholder="具体的な内容をご記入ください" maxlength="1000"></textarea>
+      <button id="reportSubmitBtn" onclick="submitReport()">送信する</button>
+      <div id="reportStatus" class="status"></div>
+    </div>
+  `;
+}
+
 function render(shift) {
+  currentStoreId = shift.storeId;
+
   if (shift.status === 'filled') {
     card.innerHTML = `
       <p class="brand">DAIDA+</p>
@@ -50,6 +84,7 @@ function render(shift) {
         ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
       </div>
       <p class="result filled">すでに他のスタッフが対応済みです。ご確認ありがとうございました！</p>
+      ${reportSectionHtml()}
     `;
     return;
   }
@@ -73,7 +108,48 @@ function render(shift) {
     ${nameField}
     <button id="respondBtn" onclick="respond()" ${staffNames.length ? '' : 'disabled'}>✋ このヘルプに入る</button>
     <div id="result" class="result"></div>
+    ${reportSectionHtml()}
   `;
+}
+
+function toggleReportBox() {
+  const box = document.getElementById('reportBox');
+  box.style.display = box.style.display === 'block' ? 'none' : 'block';
+}
+
+// 通報の送信（利用規約 第13条）。スタッフは管理者キーを持たないため認証なしで呼べる。
+// 第13条3項の規定により、送信後は受付完了の表示のみを行い、調査状況は返さない。
+async function submitReport() {
+  const targetInput = document.getElementById('reportTarget');
+  const contentInput = document.getElementById('reportContent');
+  const statusEl = document.getElementById('reportStatus');
+  const btn = document.getElementById('reportSubmitBtn');
+
+  const target = targetInput.value.trim();
+  const content = contentInput.value.trim();
+  if (!target || !content) {
+    statusEl.textContent = '通報対象と内容の両方を入力してください。';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '送信中...';
+  try {
+    const res = await fetch('/api/report', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ store_id: currentStoreId, target, content }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
+    statusEl.textContent = '✅ ' + data.message;
+    targetInput.value = '';
+    contentInput.value = '';
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function respond() {

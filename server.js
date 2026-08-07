@@ -6,6 +6,11 @@ const cors = require('cors');
 const webpush = require('web-push');
 const { createClient } = require('@supabase/supabase-js');
 const Stripe = require('stripe');
+const { getJSTMonthStartISO } = require('./lib/time');
+const { requireOwner } = require('./lib/auth');
+const { createRateLimiter } = require('./lib/rateLimit');
+const { validateReportInput } = require('./lib/reports');
+const { performStoreWithdrawal, WithdrawalError } = require('./lib/withdrawal');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -53,6 +58,12 @@ const FREE_MONTHLY_BROADCASTS = 2;
 const STORE_NAME_MAX_LENGTH = 50;
 const STAFF_NAME_MAX_LENGTH = 20;
 
+// 通報API（/api/report）は管理者キーなしで誰でも呼べる仕様のため、荒らし対策として
+// 同一IPからの短時間の大量送信を制限する（利用規約 第13条の通報機能）。
+const REPORT_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
+const REPORT_RATE_LIMIT_MAX_REQUESTS = 5; // 10分間に最大5件まで
+const isReportRequestAllowed = createRateLimiter(REPORT_RATE_LIMIT_WINDOW_MS, REPORT_RATE_LIMIT_MAX_REQUESTS);
+
 // 同じメールアドレスで2店舗目以降を登録した場合は skip_free_trial が true になっており、
 // その場合は無料期間を「登録した瞬間に終わっている」ものとして扱う（＝最初から
 // 「毎月2回まで無料」の通常運用と同じ扱いになる）。店舗名を変えて無料期間だけを
@@ -85,8 +96,9 @@ function planFromPriceId(priceId) {
 // その店舗が「今月すでに何回配信したか」をshiftsテーブルから数える
 // （専用カウンターテーブルを持たず、実績から毎回集計することで月替わりの処理を単純化している）
 async function getMonthlyBroadcastCount(storeId) {
-  const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  // サーバーのローカル時刻（Renderの場合はUTC）ではなく、日本時間（JST）基準で月初を算出する。
+  // これにより、日本時間8/1 0:00〜9:00の配信もUTC基準の「前月扱い」にならず正しく当月分として数えられる。
+  const startOfMonth = getJSTMonthStartISO();
   const { count, error } = await supabase
     .from('shifts')
     .select('*', { count: 'exact', head: true })
@@ -246,6 +258,10 @@ async function main() {
     console.log('ℹ️ STRIPE_SECRET_KEY未設定：課金アップグレード機能は無効です（無料枠のロジックは動作します）');
   }
 
+  // Render等リバースプロキシ配下で動くため、req.ip がプロキシのIPにならないよう
+  // X-Forwarded-Forを信頼する設定にする（通報APIのレート制限をIPベースで正しく行うために必要）。
+  app.set('trust proxy', true);
+
   app.use(cors());
 
   // Stripe Webhookはリクエストボディの生データ（raw body）が必要なため、
@@ -367,7 +383,7 @@ async function main() {
       const { data: store, error } = await supabase
         .from('stores')
         .select(
-          'id, name, created_at, subscription_status, subscription_plan, stripe_customer_id, stripe_subscription_id, current_period_end, skip_free_trial'
+          'id, name, email, created_at, subscription_status, subscription_plan, stripe_customer_id, stripe_subscription_id, current_period_end, skip_free_trial'
         )
         .eq('id', storeId)
         .maybeSingle();
@@ -386,15 +402,10 @@ async function main() {
     }
   }
 
-  // オーナー・店長専用の操作（スタッフ管理・料金確認・契約更新・プラン変更・解約・
-  // 支払方法変更・時間帯責任者の発行/失効）を守るためのミドルウェア。
-  // requireAdmin の後に使うことで req.role を参照できる。
-  function requireOwner(req, res, next) {
-    if (req.role !== 'owner') {
-      return res.status(403).json({ error: 'この操作はオーナー・店長のみ行えます' });
-    }
-    next();
-  }
+  // requireOwner（オーナー・店長専用の操作を守るミドルウェア。スタッフ管理・料金確認・
+  // 契約更新・プラン変更・解約・支払方法変更・時間帯責任者の発行/失効・店舗の退会が対象）は
+  // 外部サービスに依存しない純粋なロジックのため lib/auth.js に切り出し、ユニットテストで
+  // 直接検証できるようにしている（このファイル冒頭でrequire済み）。
 
   // 外形監視(UptimeRobot等)からの死活確認用。DBに触らず即応答するので軽い。
   // Renderの無料プランは15分無アクセスでスリープするため、これを5〜10分おきにpingすると
@@ -502,6 +513,19 @@ async function main() {
         .maybeSingle();
       if (existingErr) throw existingErr;
 
+      // 退会して同じメールアドレスで再登録した場合も無料期間を与えない（悪用防止）。
+      // 退会時にstoresの行自体は物理削除されるため、existingStoreの検索だけでは
+      // 「過去に退会した店舗」を見つけられない。そのため used_emails（退会時にメールの
+      // ハッシュだけを記録するテーブル）も合わせて照合する。
+      const { data: usedEmail, error: usedEmailErr } = await supabase
+        .from('used_emails')
+        .select('email_hash')
+        .eq('email_hash', hashKey(email))
+        .maybeSingle();
+      if (usedEmailErr) throw usedEmailErr;
+
+      const skipFreeTrial = !!existingStore || !!usedEmail;
+
       const adminKey = generateAdminKey();
       const { data: store, error } = await supabase
         .from('stores')
@@ -509,7 +533,7 @@ async function main() {
           name: pending.name,
           admin_key_hash: hashKey(adminKey),
           email,
-          skip_free_trial: !!existingStore,
+          skip_free_trial: skipFreeTrial,
         })
         .select()
         .single();
@@ -757,6 +781,27 @@ async function main() {
     }
   });
 
+  // スタッフ：自分の通知登録を解除する（利用規約 第17条1項「いつでも退会することができます」対応）。
+  // スタッフは管理者キーを持たないため認証なしで呼べるが、削除対象は endpoint
+  // （ブラウザが発行する推測不可能な識別子）で一意に特定するため、他人の登録を
+  // 誤って（または悪意を持って）消せる心配はない。/api/subscribe が同じ考え方で
+  // endpointをキーに upsert しているのと同様の設計。
+  // shifts.filled_by に残る過去の応募履歴は勤務実績の記録として必要なため、削除・匿名化しない。
+  app.delete('/api/subscribe', async (req, res) => {
+    const endpoint = (req.body && req.body.endpoint) || '';
+    if (!endpoint) {
+      return res.status(400).json({ error: '解除対象が指定されていません' });
+    }
+    try {
+      const { error } = await supabase.from('subscriptions').delete().eq('endpoint', endpoint);
+      if (error) throw error;
+      res.json({ message: '通知登録を解除しました' });
+    } catch (err) {
+      console.error('unsubscribe error:', err);
+      res.status(500).json({ error: '解除に失敗しました' });
+    }
+  });
+
   // オーナー・店長／時間帯責任者：ヘルプ募集を自分の店舗のスタッフに配信
   // 店舗はリクエストボディからではなく、ログインに使った管理者キーから決まる。
   // これにより、ある店舗のキーでログインした人が他店舗へ誤配信することはできない。
@@ -905,6 +950,89 @@ async function main() {
     } catch (err) {
       console.error('respond error:', err);
       res.status(500).json({ error: '応募処理に失敗しました' });
+    }
+  });
+
+  // 通報の受付（利用規約 第13条）。スタッフは管理者キーを持たないため、この
+  // エンドポイントは認証なしで誰でも呼べる（店長・時間帯責任者も同じ窓口を使う）。
+  // 認証なしで呼べる分、荒らしの標的になりうるため、同一IPからの短時間の大量送信を
+  // レート制限する（lib/rateLimit.js）。
+  // 第13条3項により「調査結果・判断理由・実施した措置の詳細を開示する義務を負わない」ため、
+  // 送信者には受付完了の表示のみを返し、調査状況等は一切返さない。
+  app.post('/api/report', async (req, res) => {
+    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+    if (!isReportRequestAllowed(clientIp)) {
+      return res.status(429).json({ error: '短時間に多くの通報が送信されています。しばらくしてから再度お試しください' });
+    }
+
+    const storeId = (req.body && req.body.store_id) || null;
+    const reporter = (req.body && req.body.reporter) || '';
+    const target = (req.body && req.body.target) || '';
+    const content = (req.body && req.body.content) || '';
+
+    const validationError = validateReportInput({ target, content, reporter });
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    try {
+      // store_idが指定されていても、実在する店舗でなければ紐付けない
+      // （DBのFK制約に依存せず、存在しないIDでも通報自体は受け付けられるようにするため）
+      let linkedStoreId = null;
+      if (storeId) {
+        const { data: store, error: storeErr } = await supabase.from('stores').select('id').eq('id', storeId).maybeSingle();
+        if (storeErr) throw storeErr;
+        if (store) linkedStoreId = store.id;
+      }
+
+      const { error: insErr } = await supabase.from('reports').insert({
+        store_id: linkedStoreId,
+        reporter: reporter.trim() || null,
+        target: target.trim(),
+        content: content.trim(),
+      });
+      if (insErr) throw insErr;
+
+      res.status(201).json({ message: '通報を受け付けました。内容を確認いたします。' });
+    } catch (err) {
+      console.error('report error:', err);
+      res.status(500).json({ error: '通報の送信に失敗しました' });
+    }
+  });
+
+  // オーナー・店長：店舗の退会（利用規約 第17条1項「いつでも退会することができます」対応）。
+  // 【最も慎重に扱うべきエンドポイント】
+  // - requireOwner を必ず通す（時間帯責任者は退会できない）
+  // - store_idはリクエストボディから受け取らず、認証済みのreq.storeId（管理者キーから
+  //   一意に決まる）のみを使う。これにより他店舗のデータを削除することはできない。
+  // - 誤操作防止のため、店舗名の入力一致を必須にする
+  // - 実際の解約・削除処理の順序（Stripe解約→used_emails記録→stores削除）は
+  //   lib/withdrawal.js の performStoreWithdrawal に集約している（順序を守る理由もそちらを参照）
+  app.post('/api/withdraw', requireAdmin, requireOwner, async (req, res) => {
+    const confirmStoreName = ((req.body && req.body.confirmStoreName) || '').trim();
+    if (!confirmStoreName || confirmStoreName !== req.storeName) {
+      return res.status(400).json({ error: '店舗名の入力が一致しません。正確に入力してください' });
+    }
+
+    try {
+      await performStoreWithdrawal({
+        supabase,
+        stripe,
+        storeId: req.storeId, // ← req.body由来の値は絶対に使わない
+        storeEmail: req.store.email,
+        stripeSubscriptionId: req.store.stripe_subscription_id,
+        hashEmail: hashKey,
+      });
+      res.json({ message: '退会処理が完了しました。ご利用ありがとうございました。' });
+    } catch (err) {
+      console.error('withdraw error:', err);
+      if (err instanceof WithdrawalError) {
+        // Stripe解約失敗時はここに来る。DBは一切変更されていない。
+        return res
+          .status(502)
+          .json({ error: '解約処理に失敗したため、退会処理を中止しました。しばらくしてから再度お試しいただくか、運営にお問い合わせください' });
+      }
+      res.status(500).json({ error: '退会処理に失敗しました' });
     }
   });
 

@@ -76,6 +76,28 @@ create table if not exists stripe_events (
   received_at timestamptz not null default now()
 );
 
+-- 退会（利用規約 第17条1項）した店舗のメールアドレスを記録し、無料期間の再取得を防ぐテーブル。
+-- 退会するとstoresの行自体を物理削除するため、「過去に退会したか」を判定する手がかりが
+-- 他に残らない。email は平文ではなく既存のhashKey()と同じSHA-256ハッシュのみを保存する。
+create table if not exists used_emails (
+  email_hash text primary key, -- メールアドレスのSHA-256ハッシュ。生のメールアドレスは保存しない
+  created_at timestamptz not null default now()
+);
+
+-- 通報（利用規約 第13条）の受付内容を保存するテーブル。
+-- スタッフは管理者キーを持たないため通報APIは認証なしで呼べる設計になっており、
+-- store_idも自己申告のため、内部の外部キーとしては使うが「本人確認済みの店舗」ではない点に注意。
+-- 店舗が退会（stores行の物理削除）した後も通報記録は調査・証跡のために残す必要があるため、
+-- CASCADE（連動削除）ではなく SET NULL（店舗との紐付けだけを外す）にしている。
+create table if not exists reports (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid references stores(id) on delete set null,
+  reporter text, -- 通報者の任意の識別情報（あだ名等。匿名可のためNULL許容）
+  target text not null, -- 通報対象
+  content text not null, -- 通報内容
+  created_at timestamptz not null default now()
+);
+
 -- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
 -- RLS（Row Level Security）は有効化していません（新規テーブルはデフォルトで無効）。
 -- service_roleキーは絶対にフロントエンド（public/配下のファイル）に埋め込まないでください。
