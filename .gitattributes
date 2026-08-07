@@ -1,0 +1,17 @@
+# テキストファイルの改行コードを LF に統一する
+# core.autocrlf の設定に依存せず、リポジトリ内は常に LF を保つ
+* text=auto eol=lf
+
+# バイナリファイルは改行変換の対象外（誤って壊れないように明示）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.zip binary
