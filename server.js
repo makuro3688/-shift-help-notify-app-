@@ -10,7 +10,8 @@ const { getJSTMonthStartISO } = require('./lib/time');
 const { requireOwner } = require('./lib/auth');
 const { createRateLimiter } = require('./lib/rateLimit');
 const { validateReportInput } = require('./lib/reports');
-const { performStoreWithdrawal, WithdrawalError } = require('./lib/withdrawal');
+const { performStoreWithdrawal, WithdrawalError, describeWithdrawalError } = require('./lib/withdrawal');
+const { resolveSkipFreeTrial } = require('./lib/signup');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -58,11 +59,19 @@ const FREE_MONTHLY_BROADCASTS = 2;
 const STORE_NAME_MAX_LENGTH = 50;
 const STAFF_NAME_MAX_LENGTH = 20;
 
+// 退会処理でStripe解約後にDB操作が失敗した場合など、運営への問い合わせを案内する際の連絡先。
+const SUPPORT_EMAIL = 'support@daida-store.jp';
+
 // 通報API（/api/report）は管理者キーなしで誰でも呼べる仕様のため、荒らし対策として
 // 同一IPからの短時間の大量送信を制限する（利用規約 第13条の通報機能）。
 const REPORT_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
 const REPORT_RATE_LIMIT_MAX_REQUESTS = 5; // 10分間に最大5件まで
 const isReportRequestAllowed = createRateLimiter(REPORT_RATE_LIMIT_WINDOW_MS, REPORT_RATE_LIMIT_MAX_REQUESTS);
+
+// 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
+// ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
+const REPORT_SOURCE_IP_MAX_LENGTH = 64;
+const REPORT_USER_AGENT_MAX_LENGTH = 256;
 
 // 同じメールアドレスで2店舗目以降を登録した場合は skip_free_trial が true になっており、
 // その場合は無料期間を「登録した瞬間に終わっている」ものとして扱う（＝最初から
@@ -260,7 +269,12 @@ async function main() {
 
   // Render等リバースプロキシ配下で動くため、req.ip がプロキシのIPにならないよう
   // X-Forwarded-Forを信頼する設定にする（通報APIのレート制限をIPベースで正しく行うために必要）。
-  app.set('trust proxy', true);
+  // 【重要】trueを指定するとX-Forwarded-Forの全ホップ（＝クライアントが自由に書ける最左値）を
+  // 信頼してしまい、攻撃者がヘッダを毎回書き換えるだけでIPベースのレート制限を無制限に回避できる。
+  // Renderの前段プロキシは1段のみのため、ホップ数を1に固定し、Renderが実際に付与した
+  // 実IP（右から1番目）だけを信頼する。
+  const TRUSTED_PROXY_HOPS = 1;
+  app.set('trust proxy', TRUSTED_PROXY_HOPS);
 
   app.use(cors());
 
@@ -505,26 +519,9 @@ async function main() {
         return res.status(400).json({ error: 'コードが正しくないか、有効期限が切れています。もう一度コードを送信してください' });
       }
 
-      const { data: existingStore, error: existingErr } = await supabase
-        .from('stores')
-        .select('id')
-        .eq('email', email)
-        .limit(1)
-        .maybeSingle();
-      if (existingErr) throw existingErr;
-
       // 退会して同じメールアドレスで再登録した場合も無料期間を与えない（悪用防止）。
-      // 退会時にstoresの行自体は物理削除されるため、existingStoreの検索だけでは
-      // 「過去に退会した店舗」を見つけられない。そのため used_emails（退会時にメールの
-      // ハッシュだけを記録するテーブル）も合わせて照合する。
-      const { data: usedEmail, error: usedEmailErr } = await supabase
-        .from('used_emails')
-        .select('email_hash')
-        .eq('email_hash', hashKey(email))
-        .maybeSingle();
-      if (usedEmailErr) throw usedEmailErr;
-
-      const skipFreeTrial = !!existingStore || !!usedEmail;
+      // 判定ロジック本体は lib/signup.js に切り出している（AC-H3-3、単体テスト対象）。
+      const skipFreeTrial = await resolveSkipFreeTrial({ supabase, email, hashEmail: hashKey });
 
       const adminKey = generateAdminKey();
       const { data: store, error } = await supabase
@@ -985,11 +982,19 @@ async function main() {
         if (store) linkedStoreId = store.id;
       }
 
+      // 通報は無認証・自己申告のため、運営が虚偽通報かどうかを判断できるよう
+      // 受信時のIPアドレスとUser-Agentを証跡として記録する（プライバシーポリシー
+      // 第2条11〜13項・第3条8項に記載済みの取得・利用目的の範囲内）。
+      const sourceIp = String(clientIp).slice(0, REPORT_SOURCE_IP_MAX_LENGTH);
+      const userAgent = String(req.headers['user-agent'] || '').slice(0, REPORT_USER_AGENT_MAX_LENGTH);
+
       const { error: insErr } = await supabase.from('reports').insert({
         store_id: linkedStoreId,
         reporter: reporter.trim() || null,
         target: target.trim(),
         content: content.trim(),
+        source_ip: sourceIp,
+        user_agent: userAgent,
       });
       if (insErr) throw insErr;
 
@@ -1027,10 +1032,10 @@ async function main() {
     } catch (err) {
       console.error('withdraw error:', err);
       if (err instanceof WithdrawalError) {
-        // Stripe解約失敗時はここに来る。DBは一切変更されていない。
-        return res
-          .status(502)
-          .json({ error: '解約処理に失敗したため、退会処理を中止しました。しばらくしてから再度お試しいただくか、運営にお問い合わせください' });
+        // 失敗した段階（stage）に応じたメッセージを組み立てる（lib/withdrawal.js参照）。
+        // Stripe解約後の段階で失敗した場合は「中止した」ではなく実態に即した案内になる。
+        const { status, message } = describeWithdrawalError(err, { supportEmail: SUPPORT_EMAIL });
+        return res.status(status).json({ error: message });
       }
       res.status(500).json({ error: '退会処理に失敗しました' });
     }

@@ -95,8 +95,19 @@ create table if not exists reports (
   reporter text, -- 通報者の任意の識別情報（あだ名等。匿名可のためNULL許容）
   target text not null, -- 通報対象
   content text not null, -- 通報内容
+  -- 通報はなりすまし・虚偽申告が可能なため、運営が真偽を判断する材料として
+  -- 受信時のIPアドレスとUser-Agentを証跡として記録する（プライバシーポリシー第2条11〜13項
+  -- 「利用履歴、操作履歴およびアクセスログ」「IPアドレス」の取得、第3条8項「不正利用の防止
+  -- およびセキュリティ対策のため」の利用目的に対応）。
+  source_ip text,
+  user_agent text,
   created_at timestamptz not null default now()
 );
+
+-- 既存環境（この列追加前に作成されたDB）向けのマイグレーション。
+-- create table if not exists は既存テーブルには列を追加しないため、明示的にALTERする。
+alter table reports add column if not exists source_ip text;
+alter table reports add column if not exists user_agent text;
 
 -- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
 -- RLS（Row Level Security）は有効化していません（新規テーブルはデフォルトで無効）。
