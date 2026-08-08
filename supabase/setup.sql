@@ -36,6 +36,7 @@ create table if not exists pending_signups (
   name text not null,
   code_hash text not null, -- 6桁確認コードのSHA-256ハッシュ。生のコードはDBに保存しない
   expires_at timestamptz not null,
+  attempts integer not null default 0, -- L-5是正: 確認コードの検証に失敗した回数。SIGNUP_CODE_MAX_ATTEMPTS（server.js）に達すると失効させ、総当たり攻撃を防ぐ
   created_at timestamptz not null default now()
 );
 
@@ -108,6 +109,9 @@ create table if not exists reports (
 -- create table if not exists は既存テーブルには列を追加しないため、明示的にALTERする。
 alter table reports add column if not exists source_ip text;
 alter table reports add column if not exists user_agent text;
+
+-- L-5是正: 確認コードの総当たり対策（試行回数の記録）。既存環境向けのマイグレーション。
+alter table pending_signups add column if not exists attempts integer not null default 0;
 
 -- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
 -- RLS（Row Level Security）は有効化していません（新規テーブルはデフォルトで無効）。

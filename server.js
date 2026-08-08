@@ -11,7 +11,12 @@ const { requireOwner } = require('./lib/auth');
 const { createRateLimiter } = require('./lib/rateLimit');
 const { validateReportInput } = require('./lib/reports');
 const { performStoreWithdrawal, WithdrawalError, describeWithdrawalError } = require('./lib/withdrawal');
-const { resolveSkipFreeTrial } = require('./lib/signup');
+const {
+  resolveSkipFreeTrial,
+  checkSignupCode,
+  SIGNUP_CODE_MAX_ATTEMPTS,
+  SIGNUP_CODE_VERIFY_FAILED_MESSAGE,
+} = require('./lib/signup');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -88,6 +93,25 @@ const REPORT_GLOBAL_RATE_LIMIT_MAX_REQUESTS = 200; // サービス全体で1時�
 const isReportAllowedGlobally = createRateLimiter(REPORT_GLOBAL_RATE_LIMIT_WINDOW_MS, REPORT_GLOBAL_RATE_LIMIT_MAX_REQUESTS);
 // グローバル制限は送信元に依存させないため、常に同じ固定キーで1つのカウンタを共有する。
 const REPORT_GLOBAL_RATE_LIMIT_KEY = 'global';
+
+// 【L-5是正】/api/signup/verify-code のIP単位レート制限（総当たり攻撃対策の補助）。
+// 主対策は「1コードあたり最大SIGNUP_CODE_MAX_ATTEMPTS(5)回で失効」だが、それだけでは
+// 「多数のメールアドレスを次々に登録し、それぞれ数回ずつ広く浅く総当たりする」攻撃を
+// 止められない（コード単位のカウントはメールごとにリセットされてしまうため）。
+// これを防ぐため、同一IPからのverify-code試行そのものにも上限を設ける。
+//
+// 上限値の根拠（10分あたり20回）：
+// 正規利用者が1回の登録でコードを打ち間違える回数は現実的には数回（コピペミス・見間違い等）で、
+// コード単位の上限(5回)に収まる。一方、店舗の共有Wi-Fi等、同一IP（グローバルIP）の背後に
+// 複数人（オーナー・店長候補など）がいて、それぞれ別々に登録を試みるケースも考慮し、
+// 「5回 × 数人ぶん」を許容できるよう10分間20回とした。これを超える試行は、正規利用では
+// 想定しにくく、コードの正誤に関わらず遮断してよい水準と判断した。
+// app.set('trust proxy', TRUSTED_PROXY_HOPS) 済みのため、req.ipは偽装できない（監査で実証済み）。
+const VERIFY_CODE_IP_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
+const VERIFY_CODE_IP_RATE_LIMIT_MAX_REQUESTS = 20; // 10分間に最大20回まで
+const isVerifyCodeAllowedByIp = createRateLimiter(VERIFY_CODE_IP_RATE_LIMIT_WINDOW_MS, VERIFY_CODE_IP_RATE_LIMIT_MAX_REQUESTS);
+// 検証失敗時のエラーメッセージ本体（コード不一致・期限切れ・上限到達で文言を区別しない）は
+// lib/signup.js の SIGNUP_CODE_VERIFY_FAILED_MESSAGE を共有する（テストからも参照するため）。
 
 // 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
 // ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
@@ -528,6 +552,15 @@ async function main() {
   // 同じメールアドレスで既に店舗を作成済みの場合、2店舗目以降は1か月間の無料配信し放題
   // 期間を付与しない（store名を変えて無料期間だけを取り続ける悪用を防ぐため）。
   app.post('/api/signup/verify-code', async (req, res) => {
+    // 【L-5是正】まずIP単位のレート制限を確認する。メールアドレスを問い合わせる前に弾くことで、
+    // 多数のメールアドレスを横断して広く浅く総当たりする攻撃を、DBに触れる前に止める。
+    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+    if (!isVerifyCodeAllowedByIp(clientIp)) {
+      return res
+        .status(429)
+        .json({ error: '短時間に確認コードの試行が多く行われています。しばらくしてから再度お試しください' });
+    }
+
     const email = ((req.body && req.body.email) || '').trim().toLowerCase();
     const code = ((req.body && req.body.code) || '').trim();
 
@@ -545,8 +578,28 @@ async function main() {
         .maybeSingle();
       if (pendingErr) throw pendingErr;
 
-      if (!pending || pending.code_hash !== hashKey(code) || new Date(pending.expires_at) < new Date()) {
-        return res.status(400).json({ error: 'コードが正しくないか、有効期限が切れています。もう一度コードを送信してください' });
+      // 【L-5是正】検証の判定自体は純粋関数(lib/signup.js)に委ね、ここではその結果に応じて
+      // DBを更新する（試行回数を進める、または上限到達時にコードを失効させる）。
+      const result = checkSignupCode({ pending, code, hashCode: hashKey });
+
+      if (!result.ok) {
+        // pendingが存在し、かつコード不一致による失敗の場合のみ試行回数を進める／失効させる。
+        // （pendingが無い・期限切れの場合は、更新すべき試行回数の記録自体が存在しないため何もしない）
+        if (pending && typeof result.nextAttempts === 'number') {
+          if (result.shouldLockout) {
+            // 上限（SIGNUP_CODE_MAX_ATTEMPTS）に到達：このコードを即座に失効させる。
+            // 行を削除することで、以後同じpending.idに対して正しいコードを入力しても
+            // 「該当するpendingが無い」扱いになり、絶対に検証を通過できなくなる。
+            await supabase.from('pending_signups').delete().eq('id', pending.id);
+          } else {
+            await supabase.from('pending_signups').update({ attempts: result.nextAttempts }).eq('id', pending.id);
+          }
+        }
+
+        // コード不一致・期限切れ・上限到達（失効）のいずれであっても同一の文言を返す。
+        // 区別して返すと、攻撃者に「まだ正解を引いていない」等の手がかりを与えてしまうため
+        // （SIGNUP_CODE_VERIFY_FAILED_MESSAGEの定義コメント参照）。
+        return res.status(400).json({ error: SIGNUP_CODE_VERIFY_FAILED_MESSAGE });
       }
 
       // 退会して同じメールアドレスで再登録した場合も無料期間を与えない（悪用防止）。
