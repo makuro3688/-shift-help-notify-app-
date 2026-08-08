@@ -13,7 +13,8 @@ const { validateReportInput } = require('./lib/reports');
 const { performStoreWithdrawal, WithdrawalError, describeWithdrawalError } = require('./lib/withdrawal');
 const {
   resolveSkipFreeTrial,
-  checkSignupCode,
+  verifySignupCode,
+  requestSignupCode,
   SIGNUP_CODE_MAX_ATTEMPTS,
   SIGNUP_CODE_VERIFY_FAILED_MESSAGE,
 } = require('./lib/signup');
@@ -112,6 +113,34 @@ const VERIFY_CODE_IP_RATE_LIMIT_MAX_REQUESTS = 20; // 10分間に最大20回ま�
 const isVerifyCodeAllowedByIp = createRateLimiter(VERIFY_CODE_IP_RATE_LIMIT_WINDOW_MS, VERIFY_CODE_IP_RATE_LIMIT_MAX_REQUESTS);
 // 検証失敗時のエラーメッセージ本体（コード不一致・期限切れ・上限到達で文言を区別しない）は
 // lib/signup.js の SIGNUP_CODE_VERIFY_FAILED_MESSAGE を共有する（テストからも参照するため）。
+
+// 【L-5是正(2周目・中-1)】/api/signup/request-code のレート制限。
+// 是正前はこのエンドポイントに一切のレート制限が無く、認証不要で任意のメールアドレス宛てに
+// 確認コードメールを送りつけられた（メール爆撃の踏み台）。加えて60秒クールダウンも
+// read-modify-writeだったため同時実行で突破でき、監査PoCでは同時500件送信で被害者に
+// 500通のメールが届くことが実証された（SECURITY_REVIEW_L5.md 中-1参照）。
+// クールダウン自体はrequest_signup_code RPC（lib/signup.js）で原子化したが、それとは別に
+// 「そもそも1つのIPが大量にメール送信を要求できる」こと自体を防ぐため、通報API(/api/report)
+// と同じ二段構え（IP単位＋サービス全体）のレート制限を追加する。
+//
+// 上限値の根拠：
+// - IP単位 1時間10通：正規利用では1つの端末から店舗登録を1時間に10回も試みることは
+//   通常想定されない（打ち間違えて再送する場合でも数回程度）。
+// - サービス全体 1時間300通：Resend等メール配信サービスの送信枠・送信レピュテーションを
+//   保護するための最終防波堤。IPをローテーションする攻撃者にはIP単位の制限が効かないため、
+//   送信元に依存しないグローバル上限が必要（/api/reportのグローバル制限と同じ考え方）。
+const REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const REQUEST_CODE_IP_RATE_LIMIT_MAX_REQUESTS = 10; // 1IPあたり1時間に10通まで
+const isRequestCodeAllowedByIp = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, REQUEST_CODE_IP_RATE_LIMIT_MAX_REQUESTS);
+
+const REQUEST_CODE_GLOBAL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const REQUEST_CODE_GLOBAL_RATE_LIMIT_MAX_REQUESTS = 300; // サービス全体で1時間あたり最大300通まで
+const isRequestCodeAllowedGlobally = createRateLimiter(
+  REQUEST_CODE_GLOBAL_RATE_LIMIT_WINDOW_MS,
+  REQUEST_CODE_GLOBAL_RATE_LIMIT_MAX_REQUESTS
+);
+// グローバル制限は送信元に依存させないため、常に同じ固定キーで1つのカウンタを共有する。
+const REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY = 'global';
 
 // 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
 // ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
@@ -491,6 +520,16 @@ async function main() {
   // 店舗名を変えるだけで無料期間（1か月間配信し放題）を何度も取り直す悪用を防ぐため、
   // 実際に受信できるメールアドレスの確認を店舗作成の前に必須にしている。
   app.post('/api/signup/request-code', async (req, res) => {
+    // 【L-5是正(2周目・中-1)】まずIP単位・サービス全体のレート制限を確認する。
+    // メールアドレスの妥当性チェックやDBアクセスより前に弾くことで、無認証で任意の
+    // メールアドレス宛てにメールを送りつける「メール爆撃の踏み台」化を防ぐ。
+    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+    if (!isRequestCodeAllowedByIp(clientIp) || !isRequestCodeAllowedGlobally(REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY)) {
+      return res
+        .status(429)
+        .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
+    }
+
     const name = ((req.body && req.body.name) || '').trim();
     const email = ((req.body && req.body.email) || '').trim().toLowerCase();
 
@@ -512,31 +551,28 @@ async function main() {
     }
 
     try {
-      // 直近60秒以内に同じメールへ送信済みなら、連打・スパム防止のため再送を待たせる
-      const { data: recent, error: recentErr } = await supabase
-        .from('pending_signups')
-        .select('created_at')
-        .eq('email', email)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (recentErr) throw recentErr;
-      if (recent && Date.now() - new Date(recent.created_at).getTime() < SIGNUP_CODE_RESEND_COOLDOWN_SECONDS * 1000) {
+      const code = generateSignupCode();
+      const expiresAt = new Date(Date.now() + SIGNUP_CODE_TTL_MINUTES * 60 * 1000).toISOString();
+
+      // 【L-5是正(2周目・中-1)】「直近送信の確認→60秒経過の判定→古い行の削除→新しい行の挿入」を
+      // 単一の原子的なSQL文(RPC)にまとめる。旧実装は複数文のread-modify-writeで、
+      // 同時多発リクエストが全員クールダウン判定をすり抜けられた（監査PoC実証済み）。
+      const requestResult = await requestSignupCode({
+        supabase,
+        email,
+        name,
+        codeHash: hashKey(code),
+        expiresAt,
+        cooldownSeconds: SIGNUP_CODE_RESEND_COOLDOWN_SECONDS,
+      });
+
+      if (!requestResult.accepted) {
+        // requestResult.retryAfterSeconds（クールダウン残り秒数）は現状フロントには返していない
+        // （文言は固定メッセージのみ）。将来、残り秒数を案内したくなった場合のために保持している。
         return res
           .status(429)
           .json({ error: '直前にコードを送信しています。1分ほど待ってから再度お試しください（メールが届かない場合は迷惑メールフォルダもご確認ください）' });
       }
-
-      const code = generateSignupCode();
-      const expiresAt = new Date(Date.now() + SIGNUP_CODE_TTL_MINUTES * 60 * 1000).toISOString();
-
-      // 同じメールの古い未確認コードは無効化する
-      await supabase.from('pending_signups').delete().eq('email', email);
-
-      const { error: insErr } = await supabase
-        .from('pending_signups')
-        .insert({ email, name, code_hash: hashKey(code), expires_at: expiresAt });
-      if (insErr) throw insErr;
 
       await sendSignupCodeEmail(email, code);
 
@@ -569,38 +605,28 @@ async function main() {
     }
 
     try {
-      const { data: pending, error: pendingErr } = await supabase
-        .from('pending_signups')
-        .select('*')
-        .eq('email', email)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (pendingErr) throw pendingErr;
-
-      // 【L-5是正】検証の判定自体は純粋関数(lib/signup.js)に委ね、ここではその結果に応じて
-      // DBを更新する（試行回数を進める、または上限到達時にコードを失効させる）。
-      const result = checkSignupCode({ pending, code, hashCode: hashKey });
+      // 【L-5是正(2周目・高-1)】存在確認・期限切れ確認・上限確認・試行枠の消費（照合の"前"に
+      // 原子的にattemptsを1つ進める）を、単一のSQL文(RPC)で不可分に行う。
+      // これにより、同時に何件リクエストが来ても、1コードにつき照合に進める回数の合計は
+      // 厳密にSIGNUP_CODE_MAX_ATTEMPTS回に制限される（旧実装はここがread-modify-writeで、
+      // 監査PoCにより並行数倍に水増しされることが実証されていた）。
+      // 上限到達後は消費自体ができなくなる（RPCのWHERE句で自然に弾かれる）ため、
+      // 「失効した行を明示的に削除する」処理も不要になった。
+      const result = await verifySignupCode({
+        supabase,
+        email,
+        code,
+        hashCode: hashKey,
+        maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS,
+      });
 
       if (!result.ok) {
-        // pendingが存在し、かつコード不一致による失敗の場合のみ試行回数を進める／失効させる。
-        // （pendingが無い・期限切れの場合は、更新すべき試行回数の記録自体が存在しないため何もしない）
-        if (pending && typeof result.nextAttempts === 'number') {
-          if (result.shouldLockout) {
-            // 上限（SIGNUP_CODE_MAX_ATTEMPTS）に到達：このコードを即座に失効させる。
-            // 行を削除することで、以後同じpending.idに対して正しいコードを入力しても
-            // 「該当するpendingが無い」扱いになり、絶対に検証を通過できなくなる。
-            await supabase.from('pending_signups').delete().eq('id', pending.id);
-          } else {
-            await supabase.from('pending_signups').update({ attempts: result.nextAttempts }).eq('id', pending.id);
-          }
-        }
-
-        // コード不一致・期限切れ・上限到達（失効）のいずれであっても同一の文言を返す。
+        // 該当なし・期限切れ・上限到達（失効）・コード不一致のいずれであっても同一の文言を返す。
         // 区別して返すと、攻撃者に「まだ正解を引いていない」等の手がかりを与えてしまうため
         // （SIGNUP_CODE_VERIFY_FAILED_MESSAGEの定義コメント参照）。
         return res.status(400).json({ error: SIGNUP_CODE_VERIFY_FAILED_MESSAGE });
       }
+      const pending = result.pending;
 
       // 退会して同じメールアドレスで再登録した場合も無料期間を与えない（悪用防止）。
       // 判定ロジック本体は lib/signup.js に切り出している（AC-H3-3、単体テスト対象）。
