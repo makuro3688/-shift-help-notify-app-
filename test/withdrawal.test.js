@@ -278,3 +278,164 @@ test('異常系(AC-F3): Stripe解約・used_emails記録は成功したがstores
   assert.match(message, /解約されました/);
   assert.doesNotMatch(message, /中止しました/);
 });
+
+// --- AC-F12(L-7): WithdrawalErrorのstage既定値が安全側であることを検証する。 ---
+// 将来Stripe解約より後段にstage指定漏れのthrowが追加されても、M-1と同じ「解約されたのに
+// 中止したと誤案内する」問題が既定値経由で静かに復活しないことを確認する。
+
+test('正常系(AC-F12): stageを明示的に指定した場合は、既定値の変更による影響を受けず従来通りの案内が返る', () => {
+  // 'stripe'段階（Stripe解約自体が失敗、DB未変更）は、既定値をunknownに変えても壊れていないこと。
+  const stripeErr = new WithdrawalError('Stripe解約に失敗', new Error('cause'), WITHDRAWAL_STAGES.STRIPE);
+  assert.strictEqual(stripeErr.stage, WITHDRAWAL_STAGES.STRIPE);
+  const stripeResult = describeWithdrawalError(stripeErr, { supportEmail: 'support@daida-store.jp' });
+  assert.strictEqual(stripeResult.status, 502);
+  assert.match(stripeResult.message, /中止しました/);
+
+  // 'used_emails'段階（Stripe解約は成功済み）も同様に従来通り。
+  const usedEmailsErr = new WithdrawalError('記録に失敗', new Error('cause'), WITHDRAWAL_STAGES.USED_EMAILS);
+  const usedEmailsResult = describeWithdrawalError(usedEmailsErr, { supportEmail: 'support@daida-store.jp' });
+  assert.strictEqual(usedEmailsResult.status, 500);
+  assert.match(usedEmailsResult.message, /解約されました/);
+});
+
+test('異常系(AC-F12): stageを指定せずにWithdrawalErrorを投げた場合（設定漏れ）、「失敗した」とも「解約された」とも断定しない案内が返る', () => {
+  // 呼び出し側がstageの指定を忘れたことを模擬する（第3引数を渡さない）。
+  const err = new WithdrawalError('想定外のエラー', new Error('cause'));
+
+  // 既定値は安全側の'unknown'になっており、以前のように'stripe'に固定されていない。
+  assert.strictEqual(err.stage, WITHDRAWAL_STAGES.UNKNOWN);
+
+  const { status, message } = describeWithdrawalError(err, { supportEmail: 'support@daida-store.jp' });
+  assert.strictEqual(status, 500);
+  // 「解約に失敗した（＝何も起きていない）」とも断定しない
+  assert.doesNotMatch(message, /中止しました/);
+  assert.doesNotMatch(message, /失敗したため/);
+  // 「解約された」とも断定しない（実際にStripe解約が完了しているかはこの時点で不明なため）
+  assert.doesNotMatch(message, /解約されました/);
+  // どちらとも言わない代わりに、サポート窓口への連絡を促す
+  assert.match(message, /support@daida-store\.jp/);
+});
+
+// --- AC-F13(L-8): Stripe解約成功後にSupabaseクライアントが例外を投げても、
+// 「解約は完了したが削除に失敗した」旨が利用者に伝わることを検証する。 ---
+// lib/withdrawal.js は従来 supabase が {error} を「返す」ケースしかWithdrawalErrorに
+// 変換していなかった。ネットワーク切断等でクライアント自体が例外を「投げる」ケースも、
+// L-8是正によりWithdrawalError（適切なstage付き）に変換されることを確認する。
+
+function createThrowingFakeSupabase(order, { upsertThrows = null, deleteThrows = null } = {}) {
+  const calls = { upsert: [], delete: [] };
+  return {
+    calls,
+    from(table) {
+      return {
+        async upsert(payload, opts) {
+          order.push(`db:${table}:upsert`);
+          calls.upsert.push({ table, payload, opts });
+          if (upsertThrows) throw upsertThrows;
+          return { error: null };
+        },
+        delete() {
+          return {
+            async eq(col, val) {
+              order.push(`db:${table}:delete`);
+              calls.delete.push({ table, col, val });
+              if (deleteThrows) throw deleteThrows;
+              return { error: null };
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+test('正常系(AC-F13): Stripe解約後の処理が全て正常に完了した場合は例外を投げず、成功として扱われる', async () => {
+  const order = createOrderTracker();
+  // upsert/deleteのいずれも例外を投げない（try/catchを追加しても正常系に影響しないことの確認）。
+  const supabase = createThrowingFakeSupabase(order);
+  const stripe = createFakeStripe(order, { subscriptionStatus: 'active' });
+
+  const result = await performStoreWithdrawal({
+    supabase,
+    stripe,
+    storeId: 'store-123',
+    storeEmail: 'owner@example.com',
+    stripeSubscriptionId: 'sub_abc',
+    hashEmail: (email) => `hash(${email})`,
+  });
+
+  assert.deepStrictEqual(result, { success: true });
+  assert.deepStrictEqual(stripe.calls.cancel, ['sub_abc']);
+});
+
+test('異常系(AC-F13-a): Stripe解約成功後、used_emails記録でSupabaseクライアントが例外を投げても「解約済み・要問い合わせ」の旨が伝わる', async () => {
+  const order = createOrderTracker();
+  const supabase = createThrowingFakeSupabase(order, {
+    upsertThrows: Object.assign(new Error('fetch failed'), { code: 'ENOTFOUND' }),
+  });
+  const stripe = createFakeStripe(order, { subscriptionStatus: 'active' });
+
+  let caught = null;
+  try {
+    await performStoreWithdrawal({
+      supabase,
+      stripe,
+      storeId: 'store-123',
+      storeEmail: 'owner@example.com',
+      stripeSubscriptionId: 'sub_abc',
+      hashEmail: (email) => `hash(${email})`,
+    });
+  } catch (err) {
+    caught = err;
+  }
+
+  // Stripeの解約は実際に完了している（＝有料機能は既に止まっている）
+  assert.deepStrictEqual(stripe.calls.cancel, ['sub_abc']);
+
+  // 素通りせず、WithdrawalErrorとして段階付きで捕捉されている
+  assert.ok(caught instanceof WithdrawalError);
+  assert.strictEqual(caught.stage, WITHDRAWAL_STAGES.USED_EMAILS);
+  assert.strictEqual(caught.cause.code, 'ENOTFOUND');
+
+  const { status, message } = describeWithdrawalError(caught, { supportEmail: 'support@daida-store.jp' });
+  assert.strictEqual(status, 500);
+  // 「解約済みだがデータ削除に失敗した」旨が伝わり、「退会処理に失敗しました」という
+  // 実態と食い違う汎用フォールバック文言（server.jsの非WithdrawalErrorの受け皿）にはならない
+  assert.match(message, /解約されました/);
+  assert.doesNotMatch(message, /中止しました/);
+});
+
+test('異常系(AC-F13-b): Stripe解約成功後、stores削除でSupabaseクライアントが例外を投げても「解約済み・要問い合わせ」の旨が伝わる', async () => {
+  const order = createOrderTracker();
+  const supabase = createThrowingFakeSupabase(order, {
+    deleteThrows: Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }),
+  });
+  const stripe = createFakeStripe(order, { subscriptionStatus: 'active' });
+
+  let caught = null;
+  try {
+    await performStoreWithdrawal({
+      supabase,
+      stripe,
+      storeId: 'store-123',
+      storeEmail: 'owner@example.com',
+      stripeSubscriptionId: 'sub_abc',
+      hashEmail: (email) => `hash(${email})`,
+    });
+  } catch (err) {
+    caught = err;
+  }
+
+  // used_emailsへの記録までは成功していることを前提として確認する
+  assert.strictEqual(supabase.calls.upsert.length, 1);
+  assert.deepStrictEqual(stripe.calls.cancel, ['sub_abc']);
+
+  assert.ok(caught instanceof WithdrawalError);
+  assert.strictEqual(caught.stage, WITHDRAWAL_STAGES.DELETE);
+  assert.strictEqual(caught.cause.code, 'ECONNRESET');
+
+  const { status, message } = describeWithdrawalError(caught, { supportEmail: 'support@daida-store.jp' });
+  assert.strictEqual(status, 500);
+  assert.match(message, /解約されました/);
+  assert.doesNotMatch(message, /中止しました/);
+});

@@ -68,6 +68,27 @@ const REPORT_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
 const REPORT_RATE_LIMIT_MAX_REQUESTS = 5; // 10分間に最大5件まで
 const isReportRequestAllowed = createRateLimiter(REPORT_RATE_LIMIT_WINDOW_MS, REPORT_RATE_LIMIT_MAX_REQUESTS);
 
+// 【M-3是正】IP単位の制限は、送信元IPを変更できる攻撃者（安価なプロキシ／VPSプールや
+// IPv6の/64割当によるIPローテーション）には効かない。異なるIPを名乗り続けるだけで
+// reportsテーブルへ事実上無制限にINSERTでき、Supabase無料枠（500MB）を枯渇させると、
+// stores/subscriptions/shiftsも含む同一データベース全体が使えなくなり、
+// 有料契約中の店舗も含めてサービスが全停止してしまう。
+// そのため、送信元IPに依存しないサービス全体のグローバル上限を別途設ける。
+//
+// 上限値の根拠（1時間あたり200件）：
+// 通報1件の最大サイズは、target(100字)+content(1000字)+reporter(50字)を日本語想定で
+// UTF-8最大3バイト/字として計算すると約3.5KB、source_ip(64字)+user_agent(256字)や
+// 行オーバーヘッドを加えても1件あたり概ね5KB以内に収まる。1時間200件を上限にすると
+// 最悪でも増加量は約1MB/時間（約24MB/日）にとどまり、無料枠500MBに達するまでには
+// 連続攻撃であっても数週間かかる計算になるため、その間に運営が使用量アラート等で
+// 気付いて対処できる。一方、通報機能は本来ごく低頻度の機能であり、正常な利用で
+// サービス全体で1時間に200件へ到達することは想定していない。
+const REPORT_GLOBAL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const REPORT_GLOBAL_RATE_LIMIT_MAX_REQUESTS = 200; // サービス全体で1時間あたり最大200件まで
+const isReportAllowedGlobally = createRateLimiter(REPORT_GLOBAL_RATE_LIMIT_WINDOW_MS, REPORT_GLOBAL_RATE_LIMIT_MAX_REQUESTS);
+// グローバル制限は送信元に依存させないため、常に同じ固定キーで1つのカウンタを共有する。
+const REPORT_GLOBAL_RATE_LIMIT_KEY = 'global';
+
 // 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
 // ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
 const REPORT_SOURCE_IP_MAX_LENGTH = 64;
@@ -273,6 +294,7 @@ async function main() {
   // 信頼してしまい、攻撃者がヘッダを毎回書き換えるだけでIPベースのレート制限を無制限に回避できる。
   // Renderの前段プロキシは1段のみのため、ホップ数を1に固定し、Renderが実際に付与した
   // 実IP（右から1番目）だけを信頼する。
+  // 【L-9】この値は「前段プロキシがちょうど1段」であるRenderへの直接デプロイ構成が前提。CDN等を前段に追加する場合はこの値の見直しが必要。
   const TRUSTED_PROXY_HOPS = 1;
   app.set('trust proxy', TRUSTED_PROXY_HOPS);
 
@@ -960,6 +982,12 @@ async function main() {
     const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
     if (!isReportRequestAllowed(clientIp)) {
       return res.status(429).json({ error: '短時間に多くの通報が送信されています。しばらくしてから再度お試しください' });
+    }
+    // 【M-3是正】IP単位の制限を通過した後で、サービス全体のグローバル上限も確認する。
+    // IPをローテーションする攻撃者はIP単位の制限を素通りできるため、これが最後の砦になる。
+    if (!isReportAllowedGlobally(REPORT_GLOBAL_RATE_LIMIT_KEY)) {
+      console.error('report: global rate limit reached', new Date().toISOString());
+      return res.status(503).json({ error: '現在通報の受付が混み合っています。しばらくしてから再度お試しください' });
     }
 
     const storeId = (req.body && req.body.store_id) || null;
