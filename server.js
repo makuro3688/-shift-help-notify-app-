@@ -133,6 +133,16 @@ const REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
 const REQUEST_CODE_IP_RATE_LIMIT_MAX_REQUESTS = 10; // 1IPあたり1時間に10通まで
 const isRequestCodeAllowedByIp = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, REQUEST_CODE_IP_RATE_LIMIT_MAX_REQUESTS);
 
+// 【L-5是正(3周目・中-B対応)】グローバル上限（1時間300通）は「メール配信サービスの送信枠を
+// 守る最終防波堤」であり撤去はしないが、独立再監査(SECURITY_REVIEW_L5_FINAL.md 中-B)で
+// 「メールアドレスの妥当性チェックより前にカウンタを消費する」実装だったことが指摘された。
+// この実装では、攻撃者は有効なメールアドレスすら不要で、不正なボディ（例:{"email":"x"}）を
+// 30IP×10回=300回投げるだけでDBアクセス・メール送信を一切発生させずにグローバル枠を
+// 使い切れてしまい、新規登録を恒久的に封じるDoSが成立する。
+// 対策として、グローバル枠の消費は「実際にメールを送る直前」（＝request_signup_code RPCで
+// クールダウン判定を通過し、本当に送信することが確定した時点）まで遅らせる
+// （下のapp.post('/api/signup/request-code', ...)内を参照。不正なボディやクールダウン中の
+// 429ではここを通過しないため、枠は消費されない。AC-L5-19）。
 const REQUEST_CODE_GLOBAL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
 const REQUEST_CODE_GLOBAL_RATE_LIMIT_MAX_REQUESTS = 300; // サービス全体で1時間あたり最大300通まで
 const isRequestCodeAllowedGlobally = createRateLimiter(
@@ -141,6 +151,19 @@ const isRequestCodeAllowedGlobally = createRateLimiter(
 );
 // グローバル制限は送信元に依存させないため、常に同じ固定キーで1つのカウンタを共有する。
 const REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY = 'global';
+
+// 【L-5是正(3周目・中-B対応)】メールアドレス単位の上限を新設する。IPをローテーションする
+// 攻撃者にはIP単位の制限（1時間10通）が効かないため、送信先メールアドレス単位でも
+// 上限を設けることで、1メールアドレスへの総当たりレートを 300回/時（5回/コード×60コード/時）
+// から 25回/時（5回/コード×5コード/時）に引き下げる（独立再監査の修正案どおり）。
+// キーには生のメールアドレスをそのまま使わず、hashKey()でハッシュ化した値を使う
+// （生アドレスをレート制限用のメモリ上に長時間置かないため）。
+const REQUEST_CODE_EMAIL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS = 5; // 同一メールアドレスへは1時間5通まで
+const isRequestCodeAllowedByEmail = createRateLimiter(
+  REQUEST_CODE_EMAIL_RATE_LIMIT_WINDOW_MS,
+  REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS
+);
 
 // 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
 // ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
@@ -520,11 +543,16 @@ async function main() {
   // 店舗名を変えるだけで無料期間（1か月間配信し放題）を何度も取り直す悪用を防ぐため、
   // 実際に受信できるメールアドレスの確認を店舗作成の前に必須にしている。
   app.post('/api/signup/request-code', async (req, res) => {
-    // 【L-5是正(2周目・中-1)】まずIP単位・サービス全体のレート制限を確認する。
-    // メールアドレスの妥当性チェックやDBアクセスより前に弾くことで、無認証で任意の
-    // メールアドレス宛てにメールを送りつける「メール爆撃の踏み台」化を防ぐ。
+    // 【L-5是正(2周目・中-1)】まずIP単位のレート制限を確認する。不正なボディであっても
+    // 同一IPからの大量送信自体は早期に弾いておきたいため、ここは従来どおりバリデーション前に行う。
+    // 【L-5是正(3周目・中-B対応）】ただしグローバル上限（サービス全体で1時間300通）は
+    // ここでは消費しない。以前はここでグローバル枠も同時に消費していたため、メールアドレスの
+    // 妥当性チェックより前にカウンタが減ってしまい、攻撃者は有効なメールアドレスすら使わず
+    // 不正なボディ（例:{"email":"x"}）を撒くだけでDBアクセス・メール送信を一切発生させずに
+    // グローバル枠を使い切り、新規登録を恒久的に封じることができた（独立再監査 中-B）。
+    // グローバル枠の消費は、実際にメールを送ることが確定する箇所（下記）まで遅らせる。
     const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
-    if (!isRequestCodeAllowedByIp(clientIp) || !isRequestCodeAllowedGlobally(REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY)) {
+    if (!isRequestCodeAllowedByIp(clientIp)) {
       return res
         .status(429)
         .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
@@ -569,9 +597,26 @@ async function main() {
       if (!requestResult.accepted) {
         // requestResult.retryAfterSeconds（クールダウン残り秒数）は現状フロントには返していない
         // （文言は固定メッセージのみ）。将来、残り秒数を案内したくなった場合のために保持している。
+        // 【中-B対応】クールダウン中の要求（429）でもグローバル枠・メール単位の枠は消費しない。
         return res
           .status(429)
           .json({ error: '直前にコードを送信しています。1分ほど待ってから再度お試しください（メールが届かない場合は迷惑メールフォルダもご確認ください）' });
+      }
+
+      // 【L-5是正(3周目・中-B対応)】ここに到達した時点で初めて「実際にメールを送る」ことが
+      // 確定する。グローバル上限（1時間300通・メール配信サービスの送信枠を守る最終防波堤）と、
+      // 新設したメールアドレス単位の上限（1時間5通・独立再監査の修正案）を、ここで初めて消費する。
+      // メール単位のキーは生アドレスではなくhashKey()したものを使う（メモリ上に生アドレスを
+      // 長時間置かないため）。
+      if (
+        !isRequestCodeAllowedByEmail(hashKey(email)) ||
+        !isRequestCodeAllowedGlobally(REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY)
+      ) {
+        // 送信枠の最終防波堤。ここで止まった場合は運用者が気付けるようログに残す。
+        console.error('[ALERT] request-code rate limit reached at send time (email or global cap)');
+        return res
+          .status(429)
+          .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
       }
 
       await sendSignupCodeEmail(email, code);
@@ -605,13 +650,16 @@ async function main() {
     }
 
     try {
-      // 【L-5是正(2周目・高-1)】存在確認・期限切れ確認・上限確認・試行枠の消費（照合の"前"に
-      // 原子的にattemptsを1つ進める）を、単一のSQL文(RPC)で不可分に行う。
-      // これにより、同時に何件リクエストが来ても、1コードにつき照合に進める回数の合計は
-      // 厳密にSIGNUP_CODE_MAX_ATTEMPTS回に制限される（旧実装はここがread-modify-writeで、
-      // 監査PoCにより並行数倍に水増しされることが実証されていた）。
-      // 上限到達後は消費自体ができなくなる（RPCのWHERE句で自然に弾かれる）ため、
-      // 「失効した行を明示的に削除する」処理も不要になった。
+      // 【L-5是正(3周目・中-A対応)】存在確認・期限切れ確認・上限確認・試行枠の消費（照合の"前"に
+      // 原子的にattemptsを1つ進める）・ハッシュ照合・一致時のpending行削除までを、
+      // 単一のSQL関数呼び出し(RPC)で不可分に行う。これにより、同時に何件リクエストが来ても、
+      // 1コードにつき照合に進める回数の合計は厳密にSIGNUP_CODE_MAX_ATTEMPTS回に制限され
+      // （並行数に依存しない。AC-L5-7・AC-L5-23）、かつ「正しいコードによる検証成功」は
+      // 構造的に高々1回しか起こらない（AC-L5-16）。
+      // 独立再監査(SECURITY_REVIEW_L5_FINAL.md 中-A)で、以前の実装は「枠の消費」だけが
+      // 原子的で「コードの使い切り」（pending行の削除）は店舗作成後の別の往復だったため、
+      // 正しいコードを同時に複数本投げると全部が照合に成功してしまい、無料期間つきの店舗を
+      // 複数作成できてしまうことが指摘された。SQL側で照合とDELETEまで完結させることで解消する。
       const result = await verifySignupCode({
         supabase,
         email,
@@ -628,26 +676,40 @@ async function main() {
       }
       const pending = result.pending;
 
-      // 退会して同じメールアドレスで再登録した場合も無料期間を与えない（悪用防止）。
-      // 判定ロジック本体は lib/signup.js に切り出している（AC-H3-3、単体テスト対象）。
-      const skipFreeTrial = await resolveSkipFreeTrial({ supabase, email, hashEmail: hashKey });
+      // 【中-A対応・重要】ここに到達した時点で、確認コードは既にconsume_signup_attempt RPCの
+      // 内部で消費（pending行を削除）済みである。したがって、これ以降の店舗作成に失敗しても
+      // 「pending行を明示的に削除する」処理は不要（既に無い）どころか、二重に削除しようとすると
+      // 無駄なDB往復になるため行わない。一方、店舗作成が失敗した場合、利用者は同じコードで
+      // やり直すことができない（コードは1回限りという設計上のトレードオフ）ため、
+      // 再送を案内するエラーメッセージを別途返す。
+      try {
+        // 退会して同じメールアドレスで再登録した場合も無料期間を与えない（悪用防止）。
+        // 判定ロジック本体は lib/signup.js に切り出している（AC-H3-3、単体テスト対象）。
+        const skipFreeTrial = await resolveSkipFreeTrial({ supabase, email, hashEmail: hashKey });
 
-      const adminKey = generateAdminKey();
-      const { data: store, error } = await supabase
-        .from('stores')
-        .insert({
-          name: pending.name,
-          admin_key_hash: hashKey(adminKey),
-          email,
-          skip_free_trial: skipFreeTrial,
-        })
-        .select()
-        .single();
-      if (error) throw error;
+        const adminKey = generateAdminKey();
+        const { data: store, error } = await supabase
+          .from('stores')
+          .insert({
+            name: pending.name,
+            admin_key_hash: hashKey(adminKey),
+            email,
+            skip_free_trial: skipFreeTrial,
+          })
+          .select()
+          .single();
+        if (error) throw error;
 
-      await supabase.from('pending_signups').delete().eq('id', pending.id);
-
-      res.status(201).json({ storeId: store.id, storeName: store.name, adminKey });
+        return res.status(201).json({ storeId: store.id, storeName: store.name, adminKey });
+      } catch (storeErr) {
+        // 確認コードの照合自体は成功し、コードは既に消費済み（再利用不可）。
+        // このメッセージで「確認コードの送信からやり直せば復旧できる」ことを利用者に伝える。
+        console.error('verify-code store creation error (code already consumed):', storeErr);
+        return res.status(500).json({
+          error:
+            '確認は完了しましたが、店舗の作成に失敗しました。お手数ですが、確認コードの送信からやり直してください',
+        });
+      }
     } catch (err) {
       console.error('verify-code error:', err);
       res.status(500).json({ error: '店舗の作成に失敗しました' });

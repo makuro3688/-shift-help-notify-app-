@@ -40,9 +40,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
 const express = require('express');
 const {
-  isSignupCodeMatch,
   verifySignupCode,
   requestSignupCode,
   SIGNUP_CODE_MAX_ATTEMPTS,
@@ -93,8 +94,12 @@ function createFakeSignupRpcSupabase(initialRows, { delayMs = NETWORK_ROUND_TRIP
   const supabase = {
     rpc(fnName, params) {
       if (fnName === 'consume_signup_attempt') {
-        // supabase/setup.sql の consume_signup_attempt と同じ判定を、同期的に1回で行う。
-        // 「該当メールの最新行を探し、attempts < p_max かつ期限内なら1つ加算して返す」。
+        // supabase/setup.sql の consume_signup_attempt（中-A是正後・新シグネチャ）と
+        // 同じ判定を、同期的に1回で行う。
+        // 「該当メールの最新行を探し、attempts < p_max かつ期限内なら1つ加算する。
+        //   さらにハッシュ照合をここで行い、一致した場合は同じ呼び出しの中で行を削除する
+        //   （＝コードの使い切りが構造的に1回だけになる。中-A是正の核心）」。
+        // 戻り値は { id, name, matched } のみで、code_hashは含めない（AC-L5-17）。
         const matches = [...rows.values()]
           .filter((r) => r.email === params.p_email)
           .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
@@ -102,7 +107,13 @@ function createFakeSignupRpcSupabase(initialRows, { delayMs = NETWORK_ROUND_TRIP
         let resultRows = [];
         if (target && target.attempts < params.p_max && new Date(target.expires_at) > new Date()) {
           target.attempts += 1;
-          resultRows = [{ ...target }];
+          const matched = target.code_hash === params.p_code_hash;
+          if (matched) {
+            // 一致した場合は同じ呼び出しの中で行を削除する（本物のRPCのDELETEに相当）。
+            // これにより、以後の呼び出しは matches が空になり、二度と成功しない。
+            rows.delete(target.id);
+          }
+          resultRows = [{ id: target.id, name: target.name, matched }];
         }
         return delay(delayMs).then(() => ({ data: resultRows, error: null }));
       }
@@ -299,6 +310,10 @@ test('正常系(AC-L5-4): 検証成功後に再度コードを要求しても、
   // 前回2回誤っていた状態から、正しいコードで成功する。
   const success = await verifySignupCode({ supabase, email, code: correctCode, hashCode: hashKey, maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS });
   assert.strictEqual(success.ok, true);
+  // 【中-A是正後の重要な変化】検証成功時に、同じRPC呼び出しの中でpending行(p7)が
+  // 削除されている（旧実装ではserver.js側が店舗作成後に別途DELETEしていたが、
+  // その処理はもう無い＝二重削除を避けるため）。
+  assert.strictEqual(rows.has('p7'), false);
 
   // 同じメールで新しく登録し直す（本物のrequestSignupCode。cooldown=0で即座に発行）。
   const newCode = '135791';
@@ -311,7 +326,11 @@ test('正常系(AC-L5-4): 検証成功後に再度コードを要求しても、
     cooldownSeconds: NO_COOLDOWN_SECONDS,
   });
   assert.strictEqual(requestResult.accepted, true);
-  assert.strictEqual(rows.get('p7').attempts, 0); // 新規発行でattemptsが0にリセットされている
+
+  // p7は既に削除済みのため、新規発行された行はemailで引き直す（新しいidで作られている）。
+  const newRow = [...rows.values()].find((r) => r.email === email);
+  assert.ok(newRow, '新しいpending行が作られているはず');
+  assert.strictEqual(newRow.attempts, 0); // 新規発行でattemptsが0にリセットされている
 
   // 4回誤っても(上限未満)、まだ失効しない＝以前の分(2または5)が加算されていないことの確認。
   // もし以前の失敗回数が引き継がれていたら、ここで5に達し失効してしまうはず。
@@ -319,7 +338,7 @@ test('正常系(AC-L5-4): 検証成功後に再度コードを要求しても、
     const r = await verifySignupCode({ supabase, email, code: 'wrong0' + i, hashCode: hashKey, maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS });
     assert.strictEqual(r.ok, false);
   }
-  assert.strictEqual(rows.get('p7').attempts, 4);
+  assert.strictEqual(newRow.attempts, 4);
 });
 
 // ============================================================
@@ -578,15 +597,26 @@ test('AC-L5-7・応用: 5回の枠のうち1回が正解でも、合計消費回
   ]);
 
   const codes = Array.from({ length: CONCURRENT_WRONG_GUESS_COUNT }, (_, i) => `wrong-${i}`);
-  codes[0] = correctCode; // 197件の誤りに1件だけ正解を混ぜる
+  codes[4] = correctCode; // 上限(5)ちょうど目の枠に正解を混ぜる（それより前の4回は誤り）
 
   const results = await Promise.all(
     codes.map((code) => verifySignupCode({ supabase, email, code, hashCode: hashKey, maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS }))
   );
 
-  assert.ok(rows.get('race3').attempts <= SIGNUP_CODE_MAX_ATTEMPTS, '試行回数が上限を超えてはならない');
   const successCount = results.filter((r) => r.ok === true).length;
   assert.ok(successCount <= 1, '正解の消費は高々1回分の枠しか使わないため、成功は1件以下のはず');
+
+  // 【中-A是正後の重要な変化】一致した場合は同じ呼び出しの中でpending行が削除される
+  // （rows.get('race3')はundefinedになる）。行が削除されているのは成功が1件あった証拠。
+  // 万一削除されず行が残っていた場合（＝成功が0件だった場合）でも、消費された試行回数
+  // （attempts）は上限を超えてはならない。
+  const remaining = rows.get('race3');
+  if (remaining) {
+    assert.strictEqual(successCount, 0, '行が残っている＝成功が無かったケースのはず');
+    assert.ok(remaining.attempts <= SIGNUP_CODE_MAX_ATTEMPTS, '試行回数が上限を超えてはならない');
+  } else {
+    assert.strictEqual(successCount, 1, '行が削除されているのは正解による成功があった場合のみのはず');
+  }
 });
 
 // ============================================================
@@ -682,22 +712,336 @@ test('AC-L5-14: request_signup_code RPCがundefinedを返した場合、fail-clo
   assert.strictEqual(result.retryAfterSeconds, 30);
 });
 
-// --- isSignupCodeMatch（純粋関数。ハッシュ比較のみを担う）そのものの単体テスト ---
-// 存在確認・期限切れ確認・試行回数の上限判定はすべてSQL側(RPC)で完了しているため、
-// この関数の責務はハッシュ比較のみに縮小されている（SECURITY_REVIEW_L5.md 高-1の
-// 修正案「純粋関数としてのテスタビリティを残したいなら、ハッシュ比較のみを担う関数に
-// 縮小する」に対応）。
+// ============================================================
+// AC-L5-16: 正しい確認コードを同時に複数本投げても、検証が成功するのは1本だけである
+// （独立再監査SECURITY_REVIEW_L5_FINAL.md 中-Aの核心。修正前は「枠の消費」だけが原子的で
+// 「照合成功時のpending行削除」は店舗作成後の別の往復だったため、正しいコードを試行枠の
+// 範囲内で同時に複数本投げると、全リクエストが照合に成功してしまい、1つのメールアドレスから
+// 無料期間つきの店舗を複数同時作成できてしまっていた。ハッシュ照合と行削除をRPC側の
+// 単一の呼び出しに集約したことで、成功が構造的に高々1回になることをここで直接検証する）。
+// ============================================================
+const CONCURRENT_CORRECT_CODE_COUNT = 5; // 試行枠(5)ちょうどの本数を同時送信
 
-test('正常系: pendingが存在し、コードが一致すればtrueになる', () => {
-  const pending = { id: 'x1', code_hash: hashKey('123123') };
-  assert.strictEqual(isSignupCodeMatch({ pending, code: '123123', hashCode: hashKey }), true);
+test('正常系(AC-L5-16): 正しいコードを試行枠ぴったりの本数だけ同時に投げても、成功は1本だけ', async () => {
+  const email = 'race-all-correct@example.com';
+  const correctCode = '567890';
+  const { supabase, rows } = createFakeSignupRpcSupabase([
+    { id: 'race4', email, code_hash: hashKey(correctCode), expires_at: FUTURE, attempts: 0, created_at: new Date().toISOString() },
+  ]);
+
+  const results = await Promise.all(
+    Array.from({ length: CONCURRENT_CORRECT_CODE_COUNT }, () =>
+      verifySignupCode({ supabase, email, code: correctCode, hashCode: hashKey, maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS })
+    )
+  );
+
+  const successCount = results.filter((r) => r.ok === true).length;
+  assert.strictEqual(
+    successCount,
+    1,
+    '同じ正しいコードを同時に複数本投げても、成功は1本だけであるべき（旧実装は試行枠の範囲内なら全本成功していた）'
+  );
+  // 成功によりpending行はRPC内で削除されている（コードの使い切りが構造的に1回だけ、の証拠）。
+  assert.strictEqual(rows.has('race4'), false);
 });
 
-test('異常系: pendingが存在しない場合はfalseになる（RPCが枠を消費できなかった場合を模す）', () => {
-  assert.strictEqual(isSignupCodeMatch({ pending: null, code: '123123', hashCode: hashKey }), false);
+test('異常系(AC-L5-16・核心): 正しいコードを同時50本投げても、成功は1本だけ（1メールから複数店舗を同時作成できたL-5の脆弱性そのものへの対策）', async () => {
+  const email = 'race-all-correct-heavy@example.com';
+  const correctCode = '013579';
+  const { supabase, rows } = createFakeSignupRpcSupabase([
+    { id: 'race5', email, code_hash: hashKey(correctCode), expires_at: FUTURE, attempts: 0, created_at: new Date().toISOString() },
+  ]);
+
+  const results = await Promise.all(
+    Array.from({ length: 50 }, () =>
+      verifySignupCode({ supabase, email, code: correctCode, hashCode: hashKey, maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS })
+    )
+  );
+
+  const successCount = results.filter((r) => r.ok === true).length;
+  assert.strictEqual(
+    successCount,
+    1,
+    '同時50本投げても成功は1本だけ。これが崩れると1つのメールアドレスから複数店舗の無料期間farmingが成立する'
+  );
+  assert.strictEqual(rows.has('race5'), false);
 });
 
-test('異常系: pendingは存在するがコードが一致しない場合はfalseになる', () => {
-  const pending = { id: 'x2', code_hash: hashKey('123123') };
-  assert.strictEqual(isSignupCodeMatch({ pending, code: '999999', hashCode: hashKey }), false);
+// ============================================================
+// AC-L5-17: consume_signup_attempt の戻り値（およびverifySignupCodeが返すpending）に
+// code_hash が含まれていない（低-3への多層防御：権限設定に漏れがあってもハッシュ自体が
+// 漏れないようにする）
+// ============================================================
+
+test('正常系(AC-L5-17): supabase/setup.sqlのconsume_signup_attemptの戻り値定義にcode_hashが含まれていない', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+  const match = sql.match(/create or replace function consume_signup_attempt\([^)]*\)\s*\nreturns table \(([^)]*)\)/);
+  assert.ok(match, 'consume_signup_attemptの定義がsetup.sqlに見つからない');
+  const returnColumns = match[1];
+  assert.match(returnColumns, /matched boolean/, '戻り値にmatchedフラグが含まれているはず');
+  assert.doesNotMatch(returnColumns, /code_hash/, '戻り値にcode_hashが含まれてはならない（低-3への多層防御）');
+});
+
+test('異常系(AC-L5-17・防御的回帰テスト): RPCが誤ってcode_hashを含む行を返しても、verifySignupCodeが返すpendingオブジェクトにはcode_hashが含まれない', async () => {
+  // consume_signup_attemptの実装が将来書き換わり、誤ってcode_hashを含めて返してしまった
+  // 場合の回帰を検出するため、あえてcode_hashを含む行を返すフェイクRPCを用意する。
+  // lib/signup.js側がpendingオブジェクトをid/nameのみで明示的に組み立てていれば、
+  // 万一RPCが余計なフィールドを返してもここで弾かれるはず。
+  const supabase = {
+    rpc: async () => ({
+      data: [{ id: 'leak-1', name: '漏洩チェック店', matched: true, code_hash: 'leaked-hash-should-not-surface' }],
+      error: null,
+    }),
+  };
+  const result = await verifySignupCode({
+    supabase,
+    email: 'leak-check@example.com',
+    code: 'whatever',
+    hashCode: hashKey,
+    maxAttempts: SIGNUP_CODE_MAX_ATTEMPTS,
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(result.pending, 'code_hash'), false);
+  assert.deepStrictEqual(Object.keys(result.pending).sort(), ['id', 'name']);
+});
+
+// ============================================================
+// AC-L5-18: 旧シグネチャのconsume_signup_attempt(text, int)をdropするSQLがあり、
+// 新シグネチャ(text, int, text)にREVOKE/GRANTが設定されている
+// ============================================================
+
+test('正常系(AC-L5-18): supabase/setup.sqlに旧シグネチャのdropと新シグネチャへのREVOKE/GRANTが存在する', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+  assert.match(
+    sql,
+    /drop function if exists consume_signup_attempt\(text,\s*int\);/,
+    '旧シグネチャ(text, int)をdropするSQLが必要'
+  );
+  assert.match(
+    sql,
+    /revoke all on function consume_signup_attempt\(text,\s*int,\s*text\) from public, anon, authenticated;/,
+    '新シグネチャ(text, int, text)に対するREVOKEが必要'
+  );
+  assert.match(
+    sql,
+    /grant execute on function consume_signup_attempt\(text,\s*int,\s*text\) to service_role;/,
+    '新シグネチャ(text, int, text)に対するGRANTが必要'
+  );
+});
+
+test('異常系(AC-L5-18・対比): 旧シグネチャ(text, int)に対するREVOKEはもう存在しない（新シグネチャへ完全移行している）', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+  assert.doesNotMatch(
+    sql,
+    /revoke all on function consume_signup_attempt\(text,\s*int\) from/,
+    '旧シグネチャに対するREVOKEが残っていてはならない（dropした関数への権限設定は無意味かつ紛らわしい）'
+  );
+});
+
+// ============================================================
+// AC-L5-19 / AC-L5-20: request-codeのグローバル上限・メールアドレス単位上限
+// （独立再監査SECURITY_REVIEW_L5_FINAL.md 中-Bの是正。旧実装はグローバル上限の消費が
+// メールアドレスの妥当性チェックより前で、攻撃者は有効なメールアドレスすら使わず
+// 不正なボディを撒くだけでDBアクセス・メール送信を一切発生させずにグローバル枠を
+// 使い切り、新規登録を恒久的に封じることができた）
+// ============================================================
+// server.jsの実際のハンドラ本体（IP確認→バリデーション→request_signup_code RPCでの
+// クールダウン判定→実際に送信する直前でグローバル枠・メール単位の枠を消費→送信、という
+// 順序）を、本物のlib/rateLimit.js・lib/signup.js(requestSignupCode)を使って
+// 最小のExpressアプリで再現する（他のテストと同じ方針。server.js自体はrequireすると
+// 即座にSupabase/Stripe等へ接続してしまうため直接requireできない）。
+// フェイクのsupabase.rpc('request_signup_code', ...)だけを差し替え、
+// 「実際にメールを送った（=送信枠を消費した）」ことを sentEmails 配列に記録して検証する。
+const REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS = 5; // server.jsの実際の値（1時間5通まで）と同じ
+
+function buildRequestCodeAppV2({ ipMax, globalMax, emailMax, cooldownSeconds = 60 }) {
+  const app = express();
+  app.set('trust proxy', TRUSTED_PROXY_HOPS);
+  const isAllowedByIp = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, ipMax);
+  const isAllowedGlobally = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, globalMax);
+  const isAllowedByEmail = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, emailMax);
+  const { supabase } = createFakeSignupRpcSupabase([], { delayMs: 0 });
+  const sentEmails = [];
+
+  function isValidEmail(value) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ''));
+  }
+
+  app.post('/api/signup/request-code', express.json(), async (req, res) => {
+    // 【中-B是正】IP単位の制限のみ、ここ（バリデーション前）で確認する。
+    // グローバル枠・メール単位の枠は、ここでは消費しない。
+    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+    if (!isAllowedByIp(clientIp)) {
+      return res.status(429).json({ error: 'ip rate limited' });
+    }
+
+    const name = ((req.body && req.body.name) || '').trim();
+    const email = ((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!name) {
+      return res.status(400).json({ error: 'name required' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'invalid email' });
+    }
+
+    const requestResult = await requestSignupCode({
+      supabase,
+      email,
+      name,
+      codeHash: hashKey('000000'),
+      expiresAt: FUTURE,
+      cooldownSeconds,
+    });
+    if (!requestResult.accepted) {
+      return res.status(429).json({ error: 'cooldown' });
+    }
+
+    // 【中-B是正の核心】ここまで到達した時点(=実際にメールを送ることが確定した時点)で、
+    // 初めてグローバル枠・メールアドレス単位の枠を消費する。
+    if (!isAllowedByEmail(hashKey(email)) || !isAllowedGlobally('global')) {
+      return res.status(429).json({ error: 'send quota exceeded' });
+    }
+
+    sentEmails.push(email);
+    res.status(200).json({ email });
+  });
+
+  return { app, sentEmails };
+}
+
+test('異常系(AC-L5-19・核心): 不正なボディ(nameなし・不正なメール)を大量に送っても、グローバル枠は消費されない', async () => {
+  const app = buildRequestCodeAppV2({ ipMax: 10000, globalMax: 5, emailMax: 5000 });
+  const server = app.app.listen(0);
+  try {
+    // 不正なボディ({"email":"x"}相当。nameが無く、メール形式としても不正)を、
+    // グローバル上限(5)を大幅に超える回数(20回)送る。
+    const invalidResults = [];
+    for (let i = 0; i < 20; i++) {
+      invalidResults.push(await postJson(server, '/api/signup/request-code', { email: 'x' }));
+    }
+    assert.strictEqual(invalidResults.every((r) => r.status === 400), true);
+
+    // その後、正規のリクエストを送ると、グローバル枠がまだ残っている（消費されていなかった）
+    // ため通る。旧実装ではこの時点でグローバル枠は既に使い切られ、429になっていたはず。
+    const validResult = await postJson(server, '/api/signup/request-code', { name: '店', email: 'legit@example.com' });
+    assert.strictEqual(validResult.status, 200);
+    assert.deepStrictEqual(app.sentEmails, ['legit@example.com']);
+  } finally {
+    server.close();
+  }
+});
+
+test('正常系(AC-L5-19): クールダウン中(429)の要求もグローバル枠を消費せず、他の正規リクエストは引き続き通る', async () => {
+  const app = buildRequestCodeAppV2({ ipMax: 10000, globalMax: 2, emailMax: 5000 });
+  const server = app.app.listen(0);
+  try {
+    // 1回目：正規に受理される（送信成功。以後60秒クールダウンが始まる）。
+    const first = await postJson(server, '/api/signup/request-code', { name: '店', email: 'cooldown-target@example.com' });
+    assert.strictEqual(first.status, 200);
+
+    // 2回目以降：同じメールに即座に再送するとクールダウン中で429になる。これを何度も送る。
+    const cooldownAttempts = [];
+    for (let i = 0; i < 10; i++) {
+      cooldownAttempts.push(
+        await postJson(server, '/api/signup/request-code', { name: '店', email: 'cooldown-target@example.com' })
+      );
+    }
+    assert.strictEqual(cooldownAttempts.every((r) => r.status === 429), true);
+
+    // グローバル枠(2)のうち1回しか使っていないはず（クールダウン中の429は消費しない）なので、
+    // 別のメールへの正規リクエストはまだ通る。
+    const other = await postJson(server, '/api/signup/request-code', { name: '店2', email: 'other-legit@example.com' });
+    assert.strictEqual(other.status, 200);
+    assert.deepStrictEqual(app.sentEmails, ['cooldown-target@example.com', 'other-legit@example.com']);
+  } finally {
+    server.close();
+  }
+});
+
+test('異常系(AC-L5-20・核心): 同一メールアドレスへのrequest-codeは、クールダウンを経過して繰り返し送っても1時間5通で頭打ちになる', async () => {
+  const app = buildRequestCodeAppV2({
+    ipMax: 10000,
+    globalMax: 10000,
+    emailMax: REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS,
+    cooldownSeconds: 0, // クールダウンの影響を排除し、メール単位の上限だけを検証する
+  });
+  const server = app.app.listen(0);
+  try {
+    const results = [];
+    for (let i = 0; i < REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS * 2; i++) {
+      results.push(await postJson(server, '/api/signup/request-code', { name: '店', email: 'heavy-sender@example.com' }));
+    }
+    assert.strictEqual(results.filter((r) => r.status === 200).length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
+    assert.strictEqual(results.filter((r) => r.status === 429).length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
+    assert.strictEqual(app.sentEmails.length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
+  } finally {
+    server.close();
+  }
+});
+
+test('正常系(AC-L5-20): 上限内であれば、同一メールアドレスへの複数回のコード送信要求も正常に受理される', async () => {
+  const app = buildRequestCodeAppV2({
+    ipMax: 10000,
+    globalMax: 10000,
+    emailMax: REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS,
+    cooldownSeconds: 0,
+  });
+  const server = app.app.listen(0);
+  try {
+    const results = [];
+    for (let i = 0; i < REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS; i++) {
+      results.push(await postJson(server, '/api/signup/request-code', { name: '店', email: 'within-limit@example.com' }));
+    }
+    assert.strictEqual(results.every((r) => r.status === 200), true);
+    assert.strictEqual(app.sentEmails.length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
+  } finally {
+    server.close();
+  }
+});
+
+// ============================================================
+// AC-L5-21: anon/authenticatedからテーブル権限をrevokeするSQLがあり、
+// setup.sqlの全テーブルを網羅している（低-3是正）
+// ============================================================
+
+test('正常系(AC-L5-21): supabase/setup.sqlの全テーブルが、anon/authenticatedからのrevoke対象に含まれている', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+
+  // setup.sqlに定義されている全テーブル名を "create table if not exists <name>" から抽出する。
+  const tableNames = [...sql.matchAll(/create table if not exists (\w+)/g)].map((m) => m[1]);
+  assert.ok(tableNames.length > 0, 'テーブル定義が1つも見つからない(正規表現が壊れている可能性)');
+
+  const revokeMatch = sql.match(/revoke all on table ([\s\S]*?)\s+from anon, authenticated;/);
+  assert.ok(revokeMatch, 'anon/authenticatedからのrevoke対象テーブル一覧が見つからない');
+  const revokedTables = revokeMatch[1]
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  for (const table of tableNames) {
+    assert.ok(revokedTables.includes(table), `テーブル "${table}" がanon/authenticatedのrevoke対象一覧に含まれていない`);
+  }
+});
+
+test('異常系(AC-L5-21・対比): alter default privilegesによる恒久化(将来追加されるテーブルへの既定revoke)も設定されている', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+  assert.match(
+    sql,
+    /alter default privileges for role postgres in schema public\s*\n\s*revoke all on tables from anon, authenticated;/,
+    '将来追加されるテーブルにも既定でrevokeされる設定（alter default privileges）が必要'
+  );
+});
+
+// ============================================================
+// 【低-1是正・静的検証】重複削除SQLがctidをタイブレーカに含んでいる
+// （created_at完全同値の重複行も削除できるようにする。ACなし・任意項目だが、
+// 監査人の修正案どおりに反映されていることを回帰検出できるようにしておく）
+// ============================================================
+test('静的検証(低-1): 重複削除SQLがctidをタイブレーカに含んでいる', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+  assert.match(
+    sql,
+    /\(a\.created_at, a\.ctid\) < \(b\.created_at, b\.ctid\)/,
+    'ctidをタイブレーカに使う重複削除SQLが必要（created_at完全同値の重複行が消せない問題の対策）'
+  );
 });

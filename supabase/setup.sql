@@ -123,8 +123,17 @@ alter table pending_signups add column if not exists attempts integer not null d
 -- 一意インデックスが必要。追加前に、過去のレース条件（今回是正する高-1のバグそのもの）に
 -- より本番環境に残っている可能性のある重複行（同一emailの複数pending行）を、
 -- 最新の1件だけ残して削除しておく（一意インデックス作成が失敗しないための安全対策）。
+--
+-- 【低-1是正（独立再監査SECURITY_REVIEW_L5_FINAL.md）】比較を厳密不等号(a.created_at < b.created_at)
+-- のみで行うと、created_at（トランザクション開始時刻。マイクロ秒精度）が完全同値になった
+-- 重複行（是正前のレース条件下で同一マイクロ秒に開始した同時到着リクエストが原因）を
+-- 1件も削除できない。ctidをタイブレーカに加え、同値でも必ず1件だけ残るようにする。
+--
+-- 適用前に、残存する重複が実際にあるか目視確認しておくことを推奨する（0件なら以下は無害）：
+--   select email, count(*) from pending_signups group by email having count(*) > 1;
 delete from pending_signups a using pending_signups b
-  where a.email = b.email and a.created_at < b.created_at;
+  where a.email = b.email
+    and (a.created_at, a.ctid) < (b.created_at, b.ctid);
 create unique index if not exists pending_signups_email_key on pending_signups (email);
 
 -- 【高-1是正】確認コードの試行枠を原子的に1つ消費する。
@@ -136,38 +145,97 @@ create unique index if not exists pending_signups_email_key on pending_signups (
 -- UPDATE...WHERE...RETURNING は単一文なので行ロックが効き、同時実行でも
 -- 「枠を取れるのは上限回数まで」が厳密に保証される。行が返らない(0行)＝
 -- 「該当なし／期限切れ／上限到達」のいずれか（呼び出し側lib/signup.jsはこれを区別しない）。
-create or replace function consume_signup_attempt(p_email text, p_max int)
-returns table (id uuid, name text, code_hash text, expires_at timestamptz, attempts int)
-language sql
+--
+-- 【中-A是正（独立再監査SECURITY_REVIEW_L5_FINAL.md）】上記の「枠の消費」は原子的だったが、
+-- 「照合が成功した場合にpending行を無効化する」処理はSQL側に無く、アプリ側で店舗作成が
+-- 終わったあとの別の往復（旧実装）だった。そのため「枠の消費」と「コードの使い切り」が
+-- 別々の操作になっており、正しいコードを試行枠の範囲内（例:5本）で同時に投げると、
+-- 全リクエストが照合に成功してしまい、無料期間つきの店舗を複数作成できてしまっていた
+-- （stores.emailに一意制約が無く、resolveSkipFreeTrialがINSERTより前にSELECTするため）。
+-- これはL-5の対策が守ろうとしていた「無料期間の使い回し防止」そのものの回避経路だった。
+--
+-- 対策として、ハッシュ照合そのものをこの関数（SQL側）に移し、
+-- 「枠を消費する→照合する→一致すれば同じ関数内でDELETEする」までを1回の呼び出しに
+-- まとめた。これにより「コードの使い切り」が構造的に1回だけになる：同時に何本投げても、
+-- 行を削除できる（＝matched=trueを返せる）のは高々1回だけである（AC-L5-16・AC-L5-23）。
+-- 戻り値からcode_hash（確認コードのハッシュ）を外したのも今回の変更点で、万一DB権限設定に
+-- 漏れがあってもハッシュ自体は漏れなくなる（低-3への多層防御。AC-L5-17）。
+-- シグネチャが変わる（p_code_hash引数の追加、戻り値の変更）ため、旧シグネチャの関数は
+-- 明示的にdropする（同名でも引数の型/個数が違う関数はPostgreSQL上は別関数として残り続け、
+-- 呼び出されないだけの死んだ関数・権限設定として残ってしまうため）。
+drop function if exists consume_signup_attempt(text, int);
+
+create or replace function consume_signup_attempt(p_email text, p_max int, p_code_hash text)
+returns table (id uuid, name text, matched boolean)
+language plpgsql
 as $$
+declare
+  v_id uuid;
+  v_name text;
+  v_hash text;
+  v_diff int := 0;
+  v_i int;
+begin
+  -- 枠を原子的に1つ消費する（従来どおり。ここが並行数に依存しない上限の担保）。
   update pending_signups p
      set attempts = p.attempts + 1
-   where p.id = (
-           select id from pending_signups
-            where email = p_email
-            order by created_at desc
-            limit 1
-         )
+   where p.email = p_email
      and p.attempts < p_max
      and p.expires_at > now()
-  returning p.id, p.name, p.code_hash, p.expires_at, p.attempts;
+  returning p.id, p.name, p.code_hash into v_id, v_name, v_hash;
+
+  if not found then
+    -- 該当なし／期限切れ／上限到達。0行を返す（呼び出し側lib/signup.jsはfail-closedで扱う）。
+    return;
+  end if;
+
+  -- 照合はSQL側で行う。code_hashは固定長（SHA-256の16進数=64文字）のため、
+  -- 途中で早期リターンせず全文字を必ず走査するXOR蓄積によって判定し、
+  -- 不一致箇所の位置に応じた応答時間の差（タイミングオラクル）が生じない構造にする
+  -- （定数時間比較）。
+  if v_hash is null or p_code_hash is null or length(v_hash) <> length(p_code_hash) then
+    return query select v_id, v_name, false;
+    return;
+  end if;
+
+  for v_i in 1..length(v_hash) loop
+    v_diff := v_diff | (ascii(substr(v_hash, v_i, 1)) # ascii(substr(p_code_hash, v_i, 1)));
+  end loop;
+
+  if v_diff <> 0 then
+    return query select v_id, v_name, false;
+    return;
+  end if;
+
+  -- 【中-A是正の核心】一致した場合は、同じ関数呼び出しの中でpending行を削除する。
+  -- これにより、コードは構造的に1回しか使い切れなくなる。
+  -- DELETEが0行だった場合、既に他の並行リクエストがこの行を消費していたことを意味する
+  -- （直前のUPDATEで取得した行ロックがこの関数の呼び出し内で保持され続けるため、通常は
+  -- 発生しないはずだが、念のためfail-closedにしておく）。
+  delete from pending_signups where id = v_id;
+  if not found then
+    return query select v_id, v_name, false;
+    return;
+  end if;
+
+  return query select v_id, v_name, true;
+end;
 $$;
 
 -- 【重要・計画担当レビュー指摘】PostgreSQLはCREATE FUNCTION時にEXECUTE権限を
 -- PUBLICへ自動的に付与する。Supabase環境ではPostgREST経由でanon/authenticated
 -- ロールからもRPCとして直接呼び出せるため、明示的にrevokeしない限り、
 -- アプリのサーバー（service_roleキー）を経由せず誰でもこの関数を実行できてしまう。
--- とくにこの関数はcode_hash（確認コードのSHA-256ハッシュ）を戻り値に含み、p_maxも
--- 呼び出し側が自由に指定できる引数のため、anonから呼べると攻撃者はハッシュを取得して
--- オフラインで6桁(100万通り)総当たりでき（サーバー側のSIGNUP_CODE_MAX_ATTEMPTSも
--- p_max=999999を渡せば無効化できる）、サーバー側の試行回数制限が意味を失う。
+-- p_maxは呼び出し側が自由に指定できる引数のため、anonから呼べると
+-- p_max=999999を渡すだけでサーバー側の試行回数制限が無効化できてしまう
+-- （戻り値からcode_hashを外した今回の変更後も、この権限設定自体は引き続き必須）。
 -- なお本関数は意図的に security definer にしていない（呼び出し元をservice_roleに
 -- 限定する設計のため、権限を不必要に広げるsecurity definerは不要）。
 -- 【重要】このGRANT/REVOKEはCREATE FUNCTIONに追随して自動実行されません。
 -- Supabase の SQL Editor で、この関数の再作成のたびに必ず手動実行してください
--- （AC-L5-12・AC-L5-13）。
-revoke all on function consume_signup_attempt(text, int) from public, anon, authenticated;
-grant execute on function consume_signup_attempt(text, int) to service_role;
+-- （AC-L5-12・AC-L5-13・AC-L5-18）。新シグネチャ(text, int, text)に対して設定する。
+revoke all on function consume_signup_attempt(text, int, text) from public, anon, authenticated;
+grant execute on function consume_signup_attempt(text, int, text) to service_role;
 
 -- 【中-1是正】確認コード再送の60秒クールダウンを原子的に判定する。
 -- 旧実装は「直近送信をSELECT→アプリ内で60秒経過を判定→古い行をDELETE→新しい行をINSERT」
@@ -226,3 +294,29 @@ grant execute on function request_signup_code(text, text, text, timestamptz, int
 -- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
 -- RLS（Row Level Security）は有効化していません（新規テーブルはデフォルトで無効）。
 -- service_roleキーは絶対にフロントエンド（public/配下のファイル）に埋め込まないでください。
+
+-- ============================================================================
+-- 【低-3是正（独立再監査SECURITY_REVIEW_L5_FINAL.md）】anonからのテーブル直アクセスを封じる。
+-- 【重要】このブロックは自動で反映されません。本番でも Supabase の SQL Editor で
+-- 必ず手動実行してください。
+-- ============================================================================
+-- RLSを有効化していない（上記コメント参照）ため、Supabaseの既定挙動（publicスキーマの
+-- テーブルはanon/authenticatedにSELECT/INSERT/UPDATE/DELETE権限が既定で付与される）が
+-- そのまま残っている場合、anonキーだけでData API経由にstores.admin_key_hashを直接
+-- 書き換えられ、requireAdmin（server.js）の照合をすり抜けてオーナー権限そのものを
+-- 奪取できてしまう。監査人はこのリポジトリ内外にanonキー・project refが公開されておらず
+-- 外部から到達できる経路を確認できなかったため【低】判定としているが、
+-- 「anonキーが漏れた場合は【高】相当になる」性質の指摘であるため、多層防御として
+-- Data APIから完全に切り離しておく。
+--
+-- この一覧は本ファイルに定義されている全テーブル（stores, supervisor_keys,
+-- pending_signups, subscriptions, shifts, app_config, stripe_events, used_emails,
+-- reports）を網羅している。新しいテーブルを追加した場合は、ここにも追記すること。
+revoke all on table stores, pending_signups, supervisor_keys, subscriptions,
+                    shifts, app_config, stripe_events, used_emails, reports
+  from anon, authenticated;
+-- 将来追加されるテーブルにも、既定でanon/authenticatedへ権限が付与されないようにする
+-- （低-2で指摘された「関数のEXECUTE権限が再作成のたびに手動運用に依存する」のと同種の
+-- 問題を、テーブル権限側でも恒久化しておく）。
+alter default privileges for role postgres in schema public
+  revoke all on tables from anon, authenticated;
