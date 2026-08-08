@@ -51,6 +51,19 @@ const {
 } = require('../lib/signup');
 const { createRateLimiter } = require('../lib/rateLimit');
 
+// 【独立再監査SECURITY_REVIEW_L5_FINAL2.md 中-2是正】server.jsは以前、requireした瞬間に
+// 環境変数チェックでprocess.exit(1)するか、不正なURLでSupabaseクライアントの生成に失敗する
+// 作りだったため、テストからrequireできなかった（AC-L5-25是正でこの問題は解消済み）。
+// ただし、/api/signup/request-code ハンドラは RESEND_API_KEY が無いと即座に500を返す設計
+// （本番での設定漏れを早期に検知するための意図的な仕様）のため、requireするより前に
+// ダミー値を設定しておく。実際のメール送信はここでは一切行わない
+// （buildApp()のoverrides.sendSignupCodeEmailで差し替える。下記参照）。
+if (!process.env.RESEND_API_KEY) {
+  process.env.RESEND_API_KEY = 'test-dummy-resend-api-key';
+}
+// server.js本体が実際に構築するExpressアプリ（AC-L5-26）。
+const { buildApp } = require('../server');
+
 // server.jsのhashKey（server.js内、SHA-256）と同じアルゴリズム。
 function hashKey(key) {
   return crypto.createHash('sha256').update(key).digest('hex');
@@ -845,73 +858,61 @@ test('異常系(AC-L5-18・対比): 旧シグネチャ(text, int)に対するREV
 // 不正なボディを撒くだけでDBアクセス・メール送信を一切発生させずにグローバル枠を
 // 使い切り、新規登録を恒久的に封じることができた）
 // ============================================================
-// server.jsの実際のハンドラ本体（IP確認→バリデーション→request_signup_code RPCでの
-// クールダウン判定→実際に送信する直前でグローバル枠・メール単位の枠を消費→送信、という
-// 順序）を、本物のlib/rateLimit.js・lib/signup.js(requestSignupCode)を使って
-// 最小のExpressアプリで再現する（他のテストと同じ方針。server.js自体はrequireすると
-// 即座にSupabase/Stripe等へ接続してしまうため直接requireできない）。
-// フェイクのsupabase.rpc('request_signup_code', ...)だけを差し替え、
-// 「実際にメールを送った（=送信枠を消費した）」ことを sentEmails 配列に記録して検証する。
+// 【独立再監査SECURITY_REVIEW_L5_FINAL2.md 中-2是正・最重要】以前のこのセクションは
+// buildRequestCodeAppV2という、server.jsの/api/signup/request-codeハンドラを手で
+// 書き写した「複製」を検証していた。そのため、server.js側でグローバル枠の消費位置を
+// 元（バリデーション前）に戻しても、複製の方は書き換わらないためテストは緑のまま残り、
+// 回帰を検出できなかった（開発担当のミューテーションテストで実証。1周目に指摘された
+// 「テストが複製を見ている」構造の再発）。
+// server.jsは、requireしただけではプロセスが起動しないよう是正済み（AC-L5-25。
+// server.js側のrequire.main === moduleガードとbuildApp()の分離を参照）なので、
+// ここではserver.jsが実際に構築したExpressアプリ（buildApp()の戻り値）をそのまま使う。
+// 差し替えるのは以下の3点のみで、ルートのハンドラ本体・チェックの順序はすべて
+// server.js本体のものを検証することになる（AC-L5-26）。
+//   1. supabase：DBアクセス部分。フェイクのRPC（createFakeSignupRpcSupabase、上部で定義済み
+//      の本物）に差し替える。
+//   2. requestCode{Ip,Email,Global}Limiter：本物のlib/rateLimit.js createRateLimiterで
+//      小さい上限のインスタンスを作り注入する。これにより、実際のグローバル上限(300/時)を
+//      待たずに高速にテストできる。
+//   3. sendSignupCodeEmail：実際にResend APIへ発信せず、送信先を記録するだけにする。
 const REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS = 5; // server.jsの実際の値（1時間5通まで）と同じ
+const TEST_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // テスト用リミッターのウィンドウ幅（テスト実行時間内では実質無関係）
 
-function buildRequestCodeAppV2({ ipMax, globalMax, emailMax, cooldownSeconds = 60 }) {
-  const app = express();
-  app.set('trust proxy', TRUSTED_PROXY_HOPS);
-  const isAllowedByIp = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, ipMax);
-  const isAllowedGlobally = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, globalMax);
-  const isAllowedByEmail = createRateLimiter(REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS, emailMax);
-  const { supabase } = createFakeSignupRpcSupabase([], { delayMs: 0 });
+// request_signup_code RPCを常にaccepted:trueとして扱うフェイク。server.jsのクールダウンは
+// 60秒固定（SIGNUP_CODE_RESEND_COOLDOWN_SECONDS）のため、メールアドレス単位の上限だけを
+// 独立して検証したいテスト（AC-L5-20）では、DB層のクールダウン判定を経由させずに常に
+// 受理させる（クールダウン自体の原子性はAC-L5-10で別途検証済み）。
+function createAlwaysAcceptRequestCodeSupabase() {
+  return {
+    rpc(fnName) {
+      if (fnName === 'request_signup_code') {
+        return Promise.resolve({ data: [{ accepted: true, retry_after_seconds: 0 }], error: null });
+      }
+      throw new Error(`想定外のRPC呼び出し: ${fnName}`);
+    },
+  };
+}
+
+// server.jsが実際に構築したアプリ(buildApp())に、テスト用の小さい上限のリミッターと
+// メール送信のダミー実装を注入する。supabaseを省略した場合は、クールダウンも本物どおりに
+// 動くフェイク（createFakeSignupRpcSupabase）を使う。
+function buildRealRequestCodeApp({ ipMax, globalMax, emailMax, supabase }) {
   const sentEmails = [];
-
-  function isValidEmail(value) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ''));
-  }
-
-  app.post('/api/signup/request-code', express.json(), async (req, res) => {
-    // 【中-B是正】IP単位の制限のみ、ここ（バリデーション前）で確認する。
-    // グローバル枠・メール単位の枠は、ここでは消費しない。
-    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
-    if (!isAllowedByIp(clientIp)) {
-      return res.status(429).json({ error: 'ip rate limited' });
-    }
-
-    const name = ((req.body && req.body.name) || '').trim();
-    const email = ((req.body && req.body.email) || '').trim().toLowerCase();
-    if (!name) {
-      return res.status(400).json({ error: 'name required' });
-    }
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ error: 'invalid email' });
-    }
-
-    const requestResult = await requestSignupCode({
-      supabase,
-      email,
-      name,
-      codeHash: hashKey('000000'),
-      expiresAt: FUTURE,
-      cooldownSeconds,
-    });
-    if (!requestResult.accepted) {
-      return res.status(429).json({ error: 'cooldown' });
-    }
-
-    // 【中-B是正の核心】ここまで到達した時点(=実際にメールを送ることが確定した時点)で、
-    // 初めてグローバル枠・メールアドレス単位の枠を消費する。
-    if (!isAllowedByEmail(hashKey(email)) || !isAllowedGlobally('global')) {
-      return res.status(429).json({ error: 'send quota exceeded' });
-    }
-
-    sentEmails.push(email);
-    res.status(200).json({ email });
+  const app = buildApp({
+    supabase: supabase || createFakeSignupRpcSupabase([], { delayMs: 0 }).supabase,
+    requestCodeIpLimiter: createRateLimiter(TEST_RATE_LIMIT_WINDOW_MS, ipMax),
+    requestCodeEmailLimiter: createRateLimiter(TEST_RATE_LIMIT_WINDOW_MS, emailMax),
+    requestCodeGlobalLimiter: createRateLimiter(TEST_RATE_LIMIT_WINDOW_MS, globalMax),
+    sendSignupCodeEmail: async (email) => {
+      sentEmails.push(email);
+    },
   });
-
   return { app, sentEmails };
 }
 
 test('異常系(AC-L5-19・核心): 不正なボディ(nameなし・不正なメール)を大量に送っても、グローバル枠は消費されない', async () => {
-  const app = buildRequestCodeAppV2({ ipMax: 10000, globalMax: 5, emailMax: 5000 });
-  const server = app.app.listen(0);
+  const { app, sentEmails } = buildRealRequestCodeApp({ ipMax: 10000, globalMax: 5, emailMax: 5000 });
+  const server = app.listen(0);
   try {
     // 不正なボディ({"email":"x"}相当。nameが無く、メール形式としても不正)を、
     // グローバル上限(5)を大幅に超える回数(20回)送る。
@@ -922,18 +923,19 @@ test('異常系(AC-L5-19・核心): 不正なボディ(nameなし・不正なメ
     assert.strictEqual(invalidResults.every((r) => r.status === 400), true);
 
     // その後、正規のリクエストを送ると、グローバル枠がまだ残っている（消費されていなかった）
-    // ため通る。旧実装ではこの時点でグローバル枠は既に使い切られ、429になっていたはず。
+    // ため通る。旧実装（またはこの是正が壊れた場合）ではこの時点でグローバル枠は
+    // 既に使い切られ、429になっていたはず。
     const validResult = await postJson(server, '/api/signup/request-code', { name: '店', email: 'legit@example.com' });
     assert.strictEqual(validResult.status, 200);
-    assert.deepStrictEqual(app.sentEmails, ['legit@example.com']);
+    assert.deepStrictEqual(sentEmails, ['legit@example.com']);
   } finally {
     server.close();
   }
 });
 
 test('正常系(AC-L5-19): クールダウン中(429)の要求もグローバル枠を消費せず、他の正規リクエストは引き続き通る', async () => {
-  const app = buildRequestCodeAppV2({ ipMax: 10000, globalMax: 2, emailMax: 5000 });
-  const server = app.app.listen(0);
+  const { app, sentEmails } = buildRealRequestCodeApp({ ipMax: 10000, globalMax: 2, emailMax: 5000 });
+  const server = app.listen(0);
   try {
     // 1回目：正規に受理される（送信成功。以後60秒クールダウンが始まる）。
     const first = await postJson(server, '/api/signup/request-code', { name: '店', email: 'cooldown-target@example.com' });
@@ -952,20 +954,20 @@ test('正常系(AC-L5-19): クールダウン中(429)の要求もグローバル
     // 別のメールへの正規リクエストはまだ通る。
     const other = await postJson(server, '/api/signup/request-code', { name: '店2', email: 'other-legit@example.com' });
     assert.strictEqual(other.status, 200);
-    assert.deepStrictEqual(app.sentEmails, ['cooldown-target@example.com', 'other-legit@example.com']);
+    assert.deepStrictEqual(sentEmails, ['cooldown-target@example.com', 'other-legit@example.com']);
   } finally {
     server.close();
   }
 });
 
 test('異常系(AC-L5-20・核心): 同一メールアドレスへのrequest-codeは、クールダウンを経過して繰り返し送っても1時間5通で頭打ちになる', async () => {
-  const app = buildRequestCodeAppV2({
+  const { app, sentEmails } = buildRealRequestCodeApp({
     ipMax: 10000,
     globalMax: 10000,
     emailMax: REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS,
-    cooldownSeconds: 0, // クールダウンの影響を排除し、メール単位の上限だけを検証する
+    supabase: createAlwaysAcceptRequestCodeSupabase(), // クールダウンの影響を排除し、メール単位の上限だけを検証する
   });
-  const server = app.app.listen(0);
+  const server = app.listen(0);
   try {
     const results = [];
     for (let i = 0; i < REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS * 2; i++) {
@@ -973,27 +975,27 @@ test('異常系(AC-L5-20・核心): 同一メールアドレスへのrequest-cod
     }
     assert.strictEqual(results.filter((r) => r.status === 200).length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
     assert.strictEqual(results.filter((r) => r.status === 429).length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
-    assert.strictEqual(app.sentEmails.length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
+    assert.strictEqual(sentEmails.length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
   } finally {
     server.close();
   }
 });
 
 test('正常系(AC-L5-20): 上限内であれば、同一メールアドレスへの複数回のコード送信要求も正常に受理される', async () => {
-  const app = buildRequestCodeAppV2({
+  const { app, sentEmails } = buildRealRequestCodeApp({
     ipMax: 10000,
     globalMax: 10000,
     emailMax: REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS,
-    cooldownSeconds: 0,
+    supabase: createAlwaysAcceptRequestCodeSupabase(),
   });
-  const server = app.app.listen(0);
+  const server = app.listen(0);
   try {
     const results = [];
     for (let i = 0; i < REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS; i++) {
       results.push(await postJson(server, '/api/signup/request-code', { name: '店', email: 'within-limit@example.com' }));
     }
     assert.strictEqual(results.every((r) => r.status === 200), true);
-    assert.strictEqual(app.sentEmails.length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
+    assert.strictEqual(sentEmails.length, REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS);
   } finally {
     server.close();
   }

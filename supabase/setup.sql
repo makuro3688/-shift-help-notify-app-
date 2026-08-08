@@ -212,7 +212,14 @@ begin
   -- DELETEが0行だった場合、既に他の並行リクエストがこの行を消費していたことを意味する
   -- （直前のUPDATEで取得した行ロックがこの関数の呼び出し内で保持され続けるため、通常は
   -- 発生しないはずだが、念のためfail-closedにしておく）。
-  delete from pending_signups where id = v_id;
+  -- 【L-5是正(独立再監査 中-1対応)】RETURNS TABLE (id uuid, ...) のidはPL/pgSQLの
+  -- OUTパラメータ＝変数として宣言される。pending_signupsにも同名のid列があるため、
+  -- 修飾せずに書くと「変数か列か曖昧」として実行時エラー(42702 column reference "id" is
+  -- ambiguous)になる。plpgsql.variable_conflictの既定はerrorであり、かつこのエラーは
+  -- CREATE FUNCTION時ではなく、この行に初めて到達したとき（＝利用者が正しい確認コードを
+  -- 入力した瞬間）にしか検出されない。暗黙のルール（#variable_conflict use_column）に
+  -- 頼らず、テーブルに別名pを付けて明示的に列を修飾することで曖昧さを解消する。
+  delete from pending_signups p where p.id = v_id;
   if not found then
     return query select v_id, v_name, false;
     return;

@@ -19,15 +19,21 @@ const {
   SIGNUP_CODE_VERIFY_FAILED_MESSAGE,
 } = require('./lib/signup');
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-  console.error('❌ SUPABASE_URLとSUPABASE_SERVICE_KEYを.envに設定してください（.env.example参照）。');
-  process.exit(1);
-}
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// 【L-5是正(独立再監査SECURITY_REVIEW_L5_FINAL2.md 中-2対応)】以前はここで
+// SUPABASE_URL等の環境変数チェックとSupabaseクライアントの生成をモジュール読み込み時
+// （＝requireした瞬間）に行っていた。そのためserver.jsはテストからrequireするだけで
+// process.exit(1)するか、不正なURLでcreateClient()が例外を投げる作りになっており、
+// テストは本体を一切requireできず（AC-L5-25）、レート制限などserver.js本体の実装を
+// 壊してもテストが検出できなかった（開発担当のミューテーションテストで実証済み）。
+// 環境変数チェックとクライアント生成はmain()の中（＝実際にサーバーを起動する時）まで
+// 遅らせ、requireしただけでは副作用が起きないようにする。
+// defaultSupabaseはmain()が起動時に代入するモジュール共有のクライアント。
+// getConfig/setConfig/getMonthlyBroadcastCountなど、buildApp()の外側で定義されている
+// ヘルパー関数はこちらを直接参照する。buildApp()内の各ルートは、テストからフェイクの
+// クライアントを注入できるよう、別途ローカル変数として受け取る（下記buildApp()参照）。
+let defaultSupabase = null;
 
 // --- 課金（Stripe）関連の設定 ---
 // STRIPE_SECRET_KEYが未設定でもアプリ自体は動く（決済ページの作成だけができない）。
@@ -205,7 +211,7 @@ async function getMonthlyBroadcastCount(storeId) {
   // サーバーのローカル時刻（Renderの場合はUTC）ではなく、日本時間（JST）基準で月初を算出する。
   // これにより、日本時間8/1 0:00〜9:00の配信もUTC基準の「前月扱い」にならず正しく当月分として数えられる。
   const startOfMonth = getJSTMonthStartISO();
-  const { count, error } = await supabase
+  const { count, error } = await defaultSupabase
     .from('shifts')
     .select('*', { count: 'exact', head: true })
     .eq('store_id', storeId)
@@ -325,13 +331,13 @@ function mapShift(row) {
 }
 
 async function getConfig(key) {
-  const { data, error } = await supabase.from('app_config').select('value').eq('key', key).maybeSingle();
+  const { data, error } = await defaultSupabase.from('app_config').select('value').eq('key', key).maybeSingle();
   if (error) throw error;
   return data ? data.value : null;
 }
 
 async function setConfig(key, value) {
-  const { error } = await supabase.from('app_config').upsert({ key, value });
+  const { error } = await defaultSupabase.from('app_config').upsert({ key, value });
   if (error) throw error;
 }
 
@@ -349,20 +355,26 @@ async function loadOrCreateVapidKeys() {
   return keys;
 }
 
-async function main() {
-  const vapidKeys = await loadOrCreateVapidKeys();
-  webpush.setVapidDetails(
-    process.env.VAPID_CONTACT_EMAIL ? `mailto:${process.env.VAPID_CONTACT_EMAIL}` : 'mailto:example@example.com',
-    vapidKeys.publicKey,
-    vapidKeys.privateKey
-  );
+// buildApp()内の /api/vapid-public-key から参照する。main()が起動時に代入する
+// （requireしただけでは未設定のnullのままだが、そのルートを叩かない限り問題にならない）。
+let sharedVapidKeys = null;
 
-  console.log('=========================================');
-  console.log('🔑 PUBLIC VAPID KEY:', vapidKeys.publicKey);
-  console.log('=========================================');
-  if (!stripe) {
-    console.log('ℹ️ STRIPE_SECRET_KEY未設定：課金アップグレード機能は無効です（無料枠のロジックは動作します）');
-  }
+// 【L-5是正(独立再監査SECURITY_REVIEW_L5_FINAL2.md 中-2対応)】
+// Expressアプリの構築（ミドルウェア・全ルートの登録）を、起動処理（VAPID鍵のロード・
+// Supabase接続・app.listen()）から切り離した関数。requireされただけでは呼び出されない
+// ため、これ自体に副作用は無い（AC-L5-25）。
+// overrides.supabase を渡すと、そのルート内で使うSupabaseクライアントを差し替えられる。
+// overrides.requestCodeIpLimiter / requestCodeEmailLimiter / requestCodeGlobalLimiter は
+// /api/signup/request-code のレート制限器を差し替える。省略時（＝本番）は、
+// 常にモジュールスコープの本物のリミッター・Supabaseクライアントを使うため、
+// このパラメータの存在自体が本番の挙動を変えることはない。
+// これにより、テストは複製ハンドラを書かずに、server.jsが実際に構築したこの関数の
+// 戻り値（Expressアプリ）そのものを検証できる（AC-L5-26。lib/rateLimit.jsの本物の
+// createRateLimiterで小さい上限のリミッターを作って注入すれば、実際のクールダウンや
+// グローバル上限(300/時)を待たずに高速にテストできる）。
+function buildApp(overrides = {}) {
+  const supabase = overrides.supabase || defaultSupabase;
+  const app = express();
 
   // Render等リバースプロキシ配下で動くため、req.ip がプロキシのIPにならないよう
   // X-Forwarded-Forを信頼する設定にする（通報APIのレート制限をIPベースで正しく行うために必要）。
@@ -534,14 +546,25 @@ async function main() {
     res.status(200).send('ok');
   });
 
-  // 公開鍵を配布するエンドポイント
+  // 公開鍵を配布するエンドポイント（sharedVapidKeysはmain()が起動時に設定する）
   app.get('/api/vapid-public-key', (req, res) => {
-    res.json({ publicKey: vapidKeys.publicKey });
+    res.json({ publicKey: sharedVapidKeys ? sharedVapidKeys.publicKey : null });
   });
 
   // 店長の自己登録 手順1：メールアドレス宛てに6桁の確認コードを送る。
   // 店舗名を変えるだけで無料期間（1か月間配信し放題）を何度も取り直す悪用を防ぐため、
   // 実際に受信できるメールアドレスの確認を店舗作成の前に必須にしている。
+  // 【L-5是正(独立再監査 中-2対応)】このルートのレート制限器は、テストから注入できるよう
+  // overridesで差し替え可能にしている。省略時（＝本番）は常にモジュールスコープの本物の
+  // リミッターを使うため、以下の3行はどのオーバーライドも渡さない本番の挙動を一切変えない。
+  const requestCodeIpLimiter = overrides.requestCodeIpLimiter || isRequestCodeAllowedByIp;
+  const requestCodeEmailLimiter = overrides.requestCodeEmailLimiter || isRequestCodeAllowedByEmail;
+  const requestCodeGlobalLimiter = overrides.requestCodeGlobalLimiter || isRequestCodeAllowedGlobally;
+  // メール送信の実体（Resend APIへの実際のfetch）もテストから差し替え可能にする。
+  // これにより、テストは実際に外部へメールを送信することなく、
+  // 「送信が確定した」ことだけを検証できる（省略時＝本番は本物のsendSignupCodeEmailを使う）。
+  const sendSignupCodeEmailFn = overrides.sendSignupCodeEmail || sendSignupCodeEmail;
+
   app.post('/api/signup/request-code', async (req, res) => {
     // 【L-5是正(2周目・中-1)】まずIP単位のレート制限を確認する。不正なボディであっても
     // 同一IPからの大量送信自体は早期に弾いておきたいため、ここは従来どおりバリデーション前に行う。
@@ -552,7 +575,7 @@ async function main() {
     // グローバル枠を使い切り、新規登録を恒久的に封じることができた（独立再監査 中-B）。
     // グローバル枠の消費は、実際にメールを送ることが確定する箇所（下記）まで遅らせる。
     const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
-    if (!isRequestCodeAllowedByIp(clientIp)) {
+    if (!requestCodeIpLimiter(clientIp)) {
       return res
         .status(429)
         .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
@@ -609,8 +632,8 @@ async function main() {
       // メール単位のキーは生アドレスではなくhashKey()したものを使う（メモリ上に生アドレスを
       // 長時間置かないため）。
       if (
-        !isRequestCodeAllowedByEmail(hashKey(email)) ||
-        !isRequestCodeAllowedGlobally(REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY)
+        !requestCodeEmailLimiter(hashKey(email)) ||
+        !requestCodeGlobalLimiter(REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY)
       ) {
         // 送信枠の最終防波堤。ここで止まった場合は運用者が気付けるようログに残す。
         console.error('[ALERT] request-code rate limit reached at send time (email or global cap)');
@@ -619,7 +642,7 @@ async function main() {
           .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
       }
 
-      await sendSignupCodeEmail(email, code);
+      await sendSignupCodeEmailFn(email, code);
 
       res.json({ message: `${email} 宛てに確認コードを送信しました。メールをご確認ください。` });
     } catch (err) {
@@ -1247,6 +1270,34 @@ async function main() {
     res.json((data || []).map((r) => ({ staffName: r.staff_name, registeredAt: r.registered_at })));
   });
 
+  return app;
+}
+
+// 実際にサーバーを起動する処理（VAPID鍵のロード・Supabase接続・app.listen()）。
+// buildApp()とは異なり副作用を伴うため、require.main === module のガード配下でのみ
+// 呼び出される（下部参照。AC-L5-25）。
+async function main() {
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    console.error('❌ SUPABASE_URLとSUPABASE_SERVICE_KEYを.envに設定してください（.env.example参照）。');
+    process.exit(1);
+  }
+  defaultSupabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+  sharedVapidKeys = await loadOrCreateVapidKeys();
+  webpush.setVapidDetails(
+    process.env.VAPID_CONTACT_EMAIL ? `mailto:${process.env.VAPID_CONTACT_EMAIL}` : 'mailto:example@example.com',
+    sharedVapidKeys.publicKey,
+    sharedVapidKeys.privateKey
+  );
+
+  console.log('=========================================');
+  console.log('🔑 PUBLIC VAPID KEY:', sharedVapidKeys.publicKey);
+  console.log('=========================================');
+  if (!stripe) {
+    console.log('ℹ️ STRIPE_SECRET_KEY未設定：課金アップグレード機能は無効です（無料枠のロジックは動作します）');
+  }
+
+  const app = buildApp();
   app.listen(PORT, () => console.log(`Server running: http://localhost:${PORT}`));
 }
 
@@ -1274,4 +1325,16 @@ async function startWithRetry(retriesLeft = 5) {
   }
 }
 
-startWithRetry();
+// 【L-5是正(独立再監査SECURITY_REVIEW_L5_FINAL2.md 中-2対応)】直接実行された場合
+// （`node server.js` や `npm start`）だけ起動処理を走らせる。require.main === module は
+// 「このファイルがエントリーポイントとして直接実行されたかどうか」を判定する
+// Node.js標準の方法で、テストから `require('../server')` した場合はfalseになるため、
+// サーバーは起動しない（AC-L5-25）。
+if (require.main === module) {
+  startWithRetry();
+}
+
+// テストから buildApp() を使えるようにexportする（AC-L5-26）。
+// main() もexportしているが、これは将来的な用途のためで、テストは通常buildApp()のみを使う
+// （main()を呼ぶと実際にSupabase接続・app.listen()が発生するため、テストからは呼ばない）。
+module.exports = { main, buildApp };
