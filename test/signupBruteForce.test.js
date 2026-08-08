@@ -625,6 +625,63 @@ test('AC-L5-10: 同時500件のrequest-codeを送っても、クールダウン�
   assert.strictEqual(rowsForEmail.length, 1);
 });
 
+// ============================================================
+// AC-L5-14: request_signup_code RPCが想定外に空を返した場合のfail-closed動作
+// ============================================================
+// lib/signup.js の requestSignupCode は、RPCが行を返さなかった場合
+// （null / 空配列[] / undefined。本来のRPC実装なら起こらないはずだが、
+// 将来の実装変更やエラーハンドリングの不備で発生しうる）、
+// 安全側（fail-closed）に倒してクールダウン中として扱う設計になっている
+// （accepted: false, retryAfterSeconds: cooldownSeconds を返す）。
+//
+// 計画担当のミューテーションテストで、この分岐を accepted: true（fail-open）に
+// 書き換えても既存94件のテストが1件も落ちないことが指摘された
+// （createFakeSignupRpcSupabase の request_signup_code は常にresponseRowを返す実装のため、
+// この空応答の経路自体を通過するテストがそもそも存在しなかった）。
+// ここでは他のフェイクを使わず、直接「空を返すRPC」を模した最小のsupabaseスタブで
+// この分岐そのものを狙い撃ちして検証する。
+test('AC-L5-14: request_signup_code RPCがnullを返した場合、fail-closedでaccepted:falseになりcooldownSecondsがそのまま返る', async () => {
+  const supabase = { rpc: async () => ({ data: null, error: null }) };
+  const result = await requestSignupCode({
+    supabase,
+    email: 'empty-response-null@example.com',
+    name: '店舗',
+    codeHash: hashKey('000000'),
+    expiresAt: FUTURE,
+    cooldownSeconds: 60,
+  });
+  assert.strictEqual(result.accepted, false);
+  assert.strictEqual(result.retryAfterSeconds, 60);
+});
+
+test('AC-L5-14: request_signup_code RPCが空配列[]を返した場合、fail-closedでaccepted:falseになる', async () => {
+  const supabase = { rpc: async () => ({ data: [], error: null }) };
+  const result = await requestSignupCode({
+    supabase,
+    email: 'empty-response-array@example.com',
+    name: '店舗',
+    codeHash: hashKey('000000'),
+    expiresAt: FUTURE,
+    cooldownSeconds: 90,
+  });
+  assert.strictEqual(result.accepted, false);
+  assert.strictEqual(result.retryAfterSeconds, 90);
+});
+
+test('AC-L5-14: request_signup_code RPCがundefinedを返した場合、fail-closedでaccepted:falseになる', async () => {
+  const supabase = { rpc: async () => ({ data: undefined, error: null }) };
+  const result = await requestSignupCode({
+    supabase,
+    email: 'empty-response-undefined@example.com',
+    name: '店舗',
+    codeHash: hashKey('000000'),
+    expiresAt: FUTURE,
+    cooldownSeconds: 30,
+  });
+  assert.strictEqual(result.accepted, false);
+  assert.strictEqual(result.retryAfterSeconds, 30);
+});
+
 // --- isSignupCodeMatch（純粋関数。ハッシュ比較のみを担う）そのものの単体テスト ---
 // 存在確認・期限切れ確認・試行回数の上限判定はすべてSQL側(RPC)で完了しているため、
 // この関数の責務はハッシュ比較のみに縮小されている（SECURITY_REVIEW_L5.md 高-1の

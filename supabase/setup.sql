@@ -153,6 +153,22 @@ as $$
   returning p.id, p.name, p.code_hash, p.expires_at, p.attempts;
 $$;
 
+-- 【重要・計画担当レビュー指摘】PostgreSQLはCREATE FUNCTION時にEXECUTE権限を
+-- PUBLICへ自動的に付与する。Supabase環境ではPostgREST経由でanon/authenticated
+-- ロールからもRPCとして直接呼び出せるため、明示的にrevokeしない限り、
+-- アプリのサーバー（service_roleキー）を経由せず誰でもこの関数を実行できてしまう。
+-- とくにこの関数はcode_hash（確認コードのSHA-256ハッシュ）を戻り値に含み、p_maxも
+-- 呼び出し側が自由に指定できる引数のため、anonから呼べると攻撃者はハッシュを取得して
+-- オフラインで6桁(100万通り)総当たりでき（サーバー側のSIGNUP_CODE_MAX_ATTEMPTSも
+-- p_max=999999を渡せば無効化できる）、サーバー側の試行回数制限が意味を失う。
+-- なお本関数は意図的に security definer にしていない（呼び出し元をservice_roleに
+-- 限定する設計のため、権限を不必要に広げるsecurity definerは不要）。
+-- 【重要】このGRANT/REVOKEはCREATE FUNCTIONに追随して自動実行されません。
+-- Supabase の SQL Editor で、この関数の再作成のたびに必ず手動実行してください
+-- （AC-L5-12・AC-L5-13）。
+revoke all on function consume_signup_attempt(text, int) from public, anon, authenticated;
+grant execute on function consume_signup_attempt(text, int) to service_role;
+
 -- 【中-1是正】確認コード再送の60秒クールダウンを原子的に判定する。
 -- 旧実装は「直近送信をSELECT→アプリ内で60秒経過を判定→古い行をDELETE→新しい行をINSERT」
 -- という複数文のread-modify-writeで、同時多発リクエストは全員がクールダウンをすり抜けられた
@@ -196,6 +212,16 @@ begin
     select false, greatest(0, (p_cooldown_seconds - extract(epoch from (now() - v_row.created_at)))::int);
 end;
 $$;
+
+-- 【重要・計画担当レビュー指摘】consume_signup_attemptと同じ理由で、この関数も
+-- CREATE FUNCTION時にEXECUTE権限がPUBLICへ自動付与されるため、anon/authenticatedから
+-- rate limitやクールダウンを迂回して直接呼び出せてしまう可能性がある。
+-- 本関数は意図的に security definer にしていない（service_role限定でアクセスする設計）。
+-- 【重要】このGRANT/REVOKEはCREATE FUNCTIONに追随して自動実行されません。
+-- Supabase の SQL Editor で、この関数の再作成のたびに必ず手動実行してください
+-- （AC-L5-12・AC-L5-13）。
+revoke all on function request_signup_code(text, text, text, timestamptz, int) from public, anon, authenticated;
+grant execute on function request_signup_code(text, text, text, timestamptz, int) to service_role;
 
 -- このアプリはサーバー（service_roleキー）からのみアクセスする設計のため、
 -- RLS（Row Level Security）は有効化していません（新規テーブルはデフォルトで無効）。
