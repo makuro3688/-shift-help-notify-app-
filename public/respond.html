@@ -24,6 +24,9 @@
   .reportBox textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 13px; font-family: inherit; margin-top: 6px; }
   .reportBox button { padding: 10px; font-size: 13px; width: 100%; margin-top: 10px; background: #888; }
   .status { margin-top: 10px; font-size: 13px; }
+  /* M-3: 18歳未満の深夜勤務（22時〜翌5時）に関する注意書き・警告のスタイル */
+  .minorNightNote { text-align: left; font-size: 12px; color: #666; background: #f4f6f9; padding: 8px 10px; border-radius: 6px; margin: 10px 0; line-height: 1.6; }
+  .minorNightWarning { text-align: left; font-size: 13px; font-weight: bold; color: #b02a2a; background: #fdecec; border: 1px solid #f5c6c6; padding: 10px 12px; border-radius: 6px; margin: 10px 0; line-height: 1.6; }
 </style>
 </head>
 <body>
@@ -37,6 +40,8 @@
   <a href="https://daida-store.jp/tokushoho" target="_blank" rel="noopener">特定商取引法に基づく表記</a>
 </footer>
 
+<!-- M-3: 深夜勤務（22時〜翌5時）判定ロジック（lib/nightWork.js と同一。サーバー側のテストで検証済み） -->
+<script src="/lib/nightWork.js"></script>
 <script>
 const params = new URLSearchParams(location.search);
 const shiftId = params.get('id');
@@ -72,6 +77,18 @@ function reportSectionHtml() {
   `;
 }
 
+// M-3 (AC-M3-9): 18歳未満の深夜勤務禁止（労働基準法61条）に関する注意書き。
+// この募集の時間帯が深夜（22時〜翌5時）にかかると判定できた場合は強調表示にする。
+// 判定できない場合も、常時表示の注意文（土台）は表示され続ける。
+// lib/nightWork.js の読み込みに失敗した場合でも、常時表示の注意文は出るようフォールバックする。
+function minorNightNoticeHtml(shift) {
+  const isNight = (typeof window.NightWork !== 'undefined') && window.NightWork.isNightWork(shift && shift.time);
+  if (isNight) {
+    return '<p class="minorNightWarning">⚠️ この募集は22時〜翌5時の時間帯にかかります。18歳未満の方は勤務できません。該当する場合は応募しないでください。</p>';
+  }
+  return '<p class="minorNightNote">※ 18歳未満の方は、22時〜翌5時の勤務ができません。該当する時間帯の募集には応募しないでください。</p>';
+}
+
 function render(shift) {
   currentStoreId = shift.storeId;
 
@@ -104,6 +121,7 @@ function render(shift) {
       ${escapeHtml(shift.date)} ${escapeHtml(shift.time)}
       ${shift.note ? '<br>' + escapeHtml(shift.note) : ''}
     </div>
+    ${minorNightNoticeHtml(shift)}
     <label style="font-size:13px;color:#555;">お名前（登録済みの一覧から選択）</label>
     ${nameField}
     <button id="respondBtn" onclick="respond()" ${staffNames.length ? '' : 'disabled'}>✋ このヘルプに入る</button>

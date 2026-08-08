@@ -372,6 +372,14 @@ async function main() {
   app.use(express.json());
   app.use(express.static(path.join(__dirname, 'public')));
 
+  // M-3: 深夜勤務（22時〜翌5時）判定ロジックは、店長ダッシュボード（ブラウザ側）でも
+  // 配信前の警告表示に使うため、このファイルのみを静的公開する。lib/ ディレクトリ全体を
+  // 公開するとサーバー内部ロジック（認証・レート制限等）まで露出してしまうため、
+  // 個別のルートで対象を1ファイルに絞る。
+  app.get('/lib/nightWork.js', (req, res) => {
+    res.sendFile(path.join(__dirname, 'lib', 'nightWork.js'));
+  });
+
   // 店長用エンドポイントの認証。管理者キーをハッシュ化し、まずオーナー用の
   // stores.admin_key_hash と一致するか調べ、一致しなければ時間帯責任者用の
   // supervisor_keys.admin_key_hash と一致するかを調べる。どちらかに一致すれば

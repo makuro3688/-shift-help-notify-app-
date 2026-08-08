@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DAIDA+ ｜ 店長用ダッシュボード</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<!-- M-3: 深夜勤務（22時〜翌5時）判定ロジック（lib/nightWork.js と同一。サーバー側のテストで検証済み） -->
+<script src="/lib/nightWork.js"></script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; background: #f4f6f9; padding: 20px; }
   .card { background: white; padding: 24px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); max-width: 480px; margin: 0 auto 20px; }
@@ -52,6 +54,9 @@
   .withdrawWarn { font-size: 13px; color: #8a2e2e; line-height: 1.7; background: #fdecec; border-radius: 8px; padding: 12px 14px; }
   .withdrawBtn { background: #b02a2a; }
   .noteBox { font-size: 12px; color: #8a5a00; background: #fff6e6; padding: 8px 10px; border-radius: 6px; margin-top: 8px; }
+  /* M-3: 18歳未満の深夜勤務（22時〜翌5時）に関する注意書き・警告のスタイル */
+  .minorNightNote { font-size: 12px; color: #666; background: #f4f6f9; padding: 8px 10px; border-radius: 6px; margin-top: 8px; line-height: 1.6; }
+  .minorNightWarning { font-size: 13px; font-weight: bold; color: #b02a2a; background: #fdecec; border: 1px solid #f5c6c6; padding: 10px 12px; border-radius: 6px; margin-top: 8px; line-height: 1.6; }
   .consentNote { font-size: 12px; color: #888; margin-top: 10px; line-height: 1.6; }
   .consentNote a { color: #00639b; }
   .siteFooter { max-width: 480px; margin: 20px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
@@ -87,7 +92,12 @@
   <label>日付</label>
   <input id="date" type="date">
   <label>時間</label>
-  <input id="time" placeholder="例：18:00〜22:00">
+  <input id="time" placeholder="例：18:00〜22:00" oninput="checkNightWorkWarning()">
+  <!-- M-3: 常時表示の注意書き（AC-M3-6）。自由入力のパースは必ず失敗しうるため、
+       判定結果に関係なく常にこの注意書きが土台として表示される。 -->
+  <p class="minorNightNote">※ 18歳未満の方は、22時〜翌5時の勤務ができません（労働基準法61条）。</p>
+  <!-- M-3: 深夜帯にかかると判定できた場合のみ表示される強調警告（AC-M3-7）。配信はブロックしない。 -->
+  <p id="nightWorkWarning" class="minorNightWarning" style="display:none;">⚠️ この時間帯は、18歳未満の方は勤務できません（労働基準法61条）。応募者の年齢をご確認ください。</p>
   <label>補足（任意）</label>
   <textarea id="note" rows="2" placeholder="例：レジ対応できる方"></textarea>
   <button id="sendBtn" onclick="sendBroadcast()">📣 自分の店舗のスタッフに通知を送る</button>
@@ -411,11 +421,26 @@ function copyStaffUrl() {
   navigator.clipboard.writeText(el.value).catch(() => document.execCommand('copy'));
 }
 
+// M-3 (AC-M3-7): 時間欄の入力から深夜帯（22時〜翌5時）にかかるかを判定し、
+// かかると判定できた場合のみ強調警告を表示する。パースできない入力では表示しない
+// （判定できないのに毎回警告すると、かえって無視されるようになるため）。
+// 警告はあくまで注意喚起であり、配信自体はブロックしない（AC-M3-10）。
+function checkNightWorkWarning() {
+  const time = document.getElementById('time').value;
+  const warningEl = document.getElementById('nightWorkWarning');
+  // lib/nightWork.js の読み込みに失敗した場合でも配信フロー自体は壊さない（土台の常時注意書きで担保）
+  const isNight = (typeof window.NightWork !== 'undefined') && window.NightWork.isNightWork(time);
+  warningEl.style.display = isNight ? 'block' : 'none';
+}
+
 async function sendBroadcast() {
   const date = document.getElementById('date').value;
   const time = document.getElementById('time').value.trim();
   const note = document.getElementById('note').value.trim();
   const statusEl = document.getElementById('status');
+
+  // 配信ボタン押下時点でも警告表示を最新化しておく（AC-M3-7）
+  checkNightWorkWarning();
 
   if (!date || !time) {
     statusEl.textContent = '日付・時間を入力してください。';
