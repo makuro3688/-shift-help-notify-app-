@@ -1,2 +1,7 @@
 node_modules/
 .env
+# 【実機検証スクリプト(scripts/verify-staging.js)是正】.env.staging には検証用Supabase
+# プロジェクトのservice_role/anonキーを書くため、.env と同様にコミットしてはならない。
+# 是正前は「.env」の完全一致のみが除外対象で、.env.staging はここに含まれていなかった
+# （行動計画書は「.gitignore に .env.* があるはず」としていたが、実際には無かった）。
+.env.*
