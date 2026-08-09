@@ -55,6 +55,26 @@
  *           区別して表示する。
  * ============================================================================
  *
+ * ============================================================================
+ * 【是正履歴2（AC-V4「検証不能」の解消・2026-08-09）】
+ * AC-V1〜AC-V3合格後、AC-V4のみ「検証不能（環境エラー）」が残っていた。
+ * 実機で疎通確認用の `GET /rest/v1/` が新形式publishable/anonキーに対して
+ * HTTP 401 `{"message":"Secret API key required", ...}` を返すことが判明した
+ * （鍵もDAIDA+実装も正しく、疎通確認の方法が不適切だった）。
+ *
+ *   AC-S12: 疎通確認のエンドポイントが実は secret キー専用だった
+ *           → `GET /rest/v1/` をやめ、`GET /auth/v1/settings` に変更した。
+ *             publishable/anonキーが有効なら200、無効なら401を返す公開エンドポイント。
+ *   AC-S13/AC-S14: 404を一律「判定不能」としていたため、setup.sqlのREVOKEにより
+ *           PostgRESTのスキーマキャッシュから外れたRPC/テーブル（＝正しく拒否されている
+ *           証拠）まで「検証不能」に倒れ、AC-V4が恒久的に合格しない状態だった
+ *           → secretキー（service_role）で `GET /rest/v1/` のOpenAPIスキーマを取得し、
+ *             対象RPC/テーブルの存在を先に確認する（fetchSecretSchemaPaths）。存在確認
+ *             できたものに限り、anonの401/403/404を「拒否＝合格」、2xxを「不合格」、
+ *             それ以外（500等）は安全側に倒して「判定不能」とする（classifyProbeResult）。
+ *             secretキーでも存在確認できない場合のみ「検証不能」とする。
+ * ============================================================================
+ *
  * 【安全装置】本番に対して誤実行されると、不要な店舗が作られたりレート制限の枠が
  * 消費されたりする。以下をすべて満たさない限り何もせず終了する。
  *   0. 接続先DBの app_config テーブルに environment='staging' の行が存在する
@@ -602,19 +622,49 @@ async function runAcV3({ supabase, buildApp, createRateLimiter, tagger }) {
   }
 }
 
-// 【中-4是正】プローブ結果を「拒否（合格）」「成功してしまった（不合格）」
-// 「404＝対象が存在せず判定不能（検証不能）」の3値に分類する。
-function classifyProbeResult(name, status, bodyText, { failures, inconclusive, details }) {
-  if (status === 404) {
+// 【是正：中-4是正の再修正（AC-S13/AC-S14対応）】
+// 旧実装は「404＝判定不能」と一律に扱っていたが、これは誤りだった。
+// supabase/setup.sqlは対象のRPC・テーブルに対して
+// `revoke all on ... from public, anon, authenticated` を実行しており、
+// PostgRESTはそのロールが実行/参照できないオブジェクトをスキーマキャッシュに載せない
+// ため、権限が無いだけの場合でも404が返る（「存在しない」のではなく「anonからは見えない」）。
+// そのため404を一律「判定不能」にすると、setup.sqlが正しく適用されているケースほど
+// AC-V4が「検証不能」のまま合格しなくなってしまう。
+// 対策として、呼び出し側で事前にsecretキー（service_role）を使い、対象のRPC/テーブルが
+// 実際に存在するかどうかを確認させ（confirmedExists）、その結果をこの関数に渡す。
+//   - confirmedExists === false （secretキーでも存在確認できない）
+//       → 「判定不能」。本当に未セットアップの可能性が高いため合否を出さない。
+//   - confirmedExists === true かつ anonが 401/403/404 のいずれか
+//       → 「拒否＝合格」。存在はするが権限が無いため弾かれた、という一番安全な状態。
+//   - confirmedExists === true かつ anonが 2xx
+//       → 「成功してしまった＝不合格」。権限が無いはずのanonから操作できてしまっている。
+//   - confirmedExists === true かつ それ以外（500等の想定外ステータス）
+//       → 拒否とも成功とも断定できないため、安全側に倒して「判定不能」。
+function classifyProbeResult(name, confirmedExists, status, bodyText, { failures, inconclusive, details }) {
+  const bodyPreview = bodyText.slice(0, 300);
+
+  if (!confirmedExists) {
     inconclusive.push(name);
     details.push(
-      `${name}: HTTP 404（対象が存在せず判定不能。supabase/setup.sqlの適用を確認してください） 本文: ${bodyText.slice(0, 300)}`
+      `${name}: secretキーでも対象の存在を確認できませんでした（判定不能。supabase/setup.sqlが適用されているか確認してください） anonの応答: HTTP ${status} 本文: ${bodyPreview}`
     );
     return;
   }
-  const rejected = status < 200 || status >= 300;
-  if (!rejected) failures.push(name);
-  details.push(`${name}: HTTP ${status}${rejected ? '（拒否・合格）' : '（成功してしまった・不合格！要即対応）'} 本文: ${bodyText.slice(0, 300)}`);
+
+  if (status >= 200 && status < 300) {
+    failures.push(name);
+    details.push(`${name}: HTTP ${status}（成功してしまった・不合格！要即対応） 本文: ${bodyPreview}`);
+    return;
+  }
+
+  if (status === 401 || status === 403 || status === 404) {
+    details.push(`${name}: HTTP ${status}（対象の存在はsecretキーで確認済み。拒否・合格） 本文: ${bodyPreview}`);
+    return;
+  }
+
+  // 401/403/404以外（500等）は「拒否された」という確証が無いため、合格にはせず判定不能とする。
+  inconclusive.push(name);
+  details.push(`${name}: 想定外のHTTPステータス ${status}（拒否とも成功とも判定できないため判定不能） 本文: ${bodyPreview}`);
 }
 
 // 【是正：AC-V4がHTTP 401で検証不能になる不具合の修正】
@@ -628,35 +678,70 @@ function classifyProbeResult(name, status, bodyText, { failures, inconclusive, d
 // `apikey` と `Authorization: Bearer` の両方に入れる必要がある（PostgRESTの仕様）。
 // AC-V4内の全fetch（疎通確認・RPC・GET・INSERT・UPDATE）でヘッダ生成を統一するため、
 // この1関数にまとめ、キーの接頭辞（`sb_`かどうか）で自動判定する。
-function buildAnonAuthHeaders(anonKey, extraHeaders = {}) {
-  const isNewFormatKey = typeof anonKey === 'string' && anonKey.startsWith('sb_');
+// 【是正：AC-S13対応で関数名を汎用化】この判定ロジックはanonキーだけでなく、
+// secretキー（service_role）でも全く同じ（新形式なら`apikey`のみ、旧JWT形式なら
+// `apikey`+`Authorization: Bearer`両方）なので、AC-V4内の「secretキーで存在確認する」
+// 処理にもそのまま使い回せるよう、関数名をbuildAnonAuthHeadersからbuildApiKeyHeadersに変更した。
+function buildApiKeyHeaders(apiKey, extraHeaders = {}) {
+  const isNewFormatKey = typeof apiKey === 'string' && apiKey.startsWith('sb_');
   const baseHeaders = isNewFormatKey
-    ? { apikey: anonKey }
-    : { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+    ? { apikey: apiKey }
+    : { apikey: apiKey, Authorization: `Bearer ${apiKey}` };
   return { ...baseHeaders, ...extraHeaders };
 }
 
+// 【是正：AC-S13】secretキー（service_role）でPostgRESTのOpenAPIスキーマ
+// （GET /rest/v1/）を取得し、対象のRPC・テーブルが実際に存在するかどうかを確認する。
+// このエンドポイントはAC-V4の疎通確認で以前使っていた `GET /rest/v1/` そのものだが、
+// 実機で "Only secret API keys can be used for this endpoint." というHTTP 401が
+// 確認されたとおり、secretキー専用のエンドポイントである。逆に言えば、secretキーで
+// 叩けば必ずservice_roleから見えるフルスキーマ（GRANT/REVOKEの影響を受けない）が
+// 返るため、「対象が本当に存在するか」を安全に（実際にRPCを実行せず副作用ゼロで）
+// 確認する手段として使える。PostgRESTのOpenAPI(Swagger)仕様は、`paths`オブジェクトの
+// キーとしてテーブルは `/テーブル名`、RPCは `/rpc/関数名` を持つ。
+async function fetchSecretSchemaPaths(supabaseUrl, secretKey) {
+  const res = await fetch(`${supabaseUrl}/rest/v1/`, {
+    headers: buildApiKeyHeaders(secretKey),
+  });
+  const bodyText = await res.text();
+  if (res.status !== 200) {
+    return { ok: false, status: res.status, bodyText: bodyText.slice(0, 500) };
+  }
+  const json = safeJsonParse(bodyText);
+  if (!json || typeof json.paths !== 'object' || json.paths === null) {
+    return {
+      ok: false,
+      status: res.status,
+      bodyText: '(OpenAPIスキーマのparseに失敗、または paths フィールドがありません)',
+    };
+  }
+  return { ok: true, paths: new Set(Object.keys(json.paths)) };
+}
+
 // --- AC-V4: anonキーからアクセスできない ---
-async function runAcV4({ supabaseUrl, anonKey }) {
+async function runAcV4({ supabaseUrl, anonKey, secretKey }) {
   const id = 'AC-V4';
   const label = 'anon からアクセスできない';
   const details = [];
   const failures = [];
   const inconclusive = [];
 
-  const authHeaders = buildAnonAuthHeaders(anonKey, { 'Content-Type': 'application/json' });
+  const authHeaders = buildApiKeyHeaders(anonKey, { 'Content-Type': 'application/json' });
 
-  // 【中-4是正・前提確認】anonキーそのものが有効か、意図的に許可されているエンドポイント
-  // （PostgRESTのルート）で疎通確認する。無効な鍵（貼り間違い・別プロジェクトの鍵など）だと
-  // 以降の全プローブが401を返すため、「何も検証していないのに全部合格」という偽陽性が
-  // 起こりうる（監査で指摘済み）。ここで弾ければ「不合格」ではなく「検証不能」として返す。
-  const readinessRes = await fetch(`${supabaseUrl}/rest/v1/`, {
-    headers: buildAnonAuthHeaders(anonKey),
+  // 【是正：AC-S12】疎通確認のエンドポイントを `GET /rest/v1/`（secretキー専用。実機で
+  // "Only secret API keys can be used for this endpoint." というHTTP 401を確認済み）
+  // から `GET /auth/v1/settings` に変更する。このエンドポイントはSupabase Authの
+  // 公開設定（サインアップ可否等）を返すもので、`apikey` ヘッダに有効な
+  // publishable/anonキーを渡せば200、無効な鍵なら401を返す。公式ドキュメントに
+  // 明記された「anon/publishableキーが有効かどうか」だけを切り分けるための
+  // エンドポイントであり、テーブルやRPCといったDAIDA+のデータには一切触れないため、
+  // 疎通確認そのものが誤検知（偽陽性/偽陰性）を生む心配もない。
+  const readinessRes = await fetch(`${supabaseUrl}/auth/v1/settings`, {
+    headers: buildApiKeyHeaders(anonKey),
   });
   if (readinessRes.status !== 200) {
-    // 【是正：AC-S9】失敗理由が分かるよう、ステータスコードとレスポンス本文を表示する。
-    // 鍵の値そのものは決して出力しない（本文にヘッダの値が含まれることは無いが、
-    // 念のため鍵の変数はここでは一切文字列結合に使わない）。
+    // 【AC-S9を踏襲】失敗理由が分かるよう、ステータスコードとレスポンス本文を表示する。
+    // 鍵の値そのものは決して出力しない。
     let readinessBody = '';
     try {
       readinessBody = (await readinessRes.text()).slice(0, 500);
@@ -668,8 +753,24 @@ async function runAcV4({ supabaseUrl, anonKey }) {
       label,
       pass: false,
       envError: true,
-      summary: `anonキーがPostgRESTに受け付けられませんでした（HTTP ${readinessRes.status}）。SUPABASE_ANON_KEYが正しいか確認してください（検証不能）`,
+      summary: `anonキーが/auth/v1/settingsに受け付けられませんでした（HTTP ${readinessRes.status}）。SUPABASE_ANON_KEYが正しいか確認してください（検証不能）`,
       detail: `疎通確認レスポンス本文（鍵の値は含みません）: ${readinessBody || '(空)'}`,
+    };
+  }
+
+  // 【是正：AC-S13】anonの404を無条件で「判定不能」とせず、secretキーで対象の存在を
+  // 先に確認する。secretキーでの疎通・スキーマ取得自体が失敗した場合、以降の全プローブの
+  // 存在確認ができないため、AC-V4全体を「検証不能」として打ち切る（SUPABASE_SERVICE_KEYの
+  // 誤りやsetup.sql未適用の可能性がある）。
+  const secretSchema = await fetchSecretSchemaPaths(supabaseUrl, secretKey);
+  if (!secretSchema.ok) {
+    return {
+      id,
+      label,
+      pass: false,
+      envError: true,
+      summary: `secretキー（SUPABASE_SERVICE_KEY）でのスキーマ確認に失敗しました（HTTP ${secretSchema.status}）。RPC/テーブルの存在確認ができないため検証不能です`,
+      detail: `スキーマ確認レスポンス本文（鍵の値は含みません）: ${secretSchema.bodyText || '(空)'}`,
     };
   }
 
@@ -691,25 +792,32 @@ async function runAcV4({ supabaseUrl, anonKey }) {
     },
   ];
   for (const probe of rpcProbes) {
+    const confirmedExists = secretSchema.paths.has(`/rpc/${probe.name}`);
     const res = await fetch(`${supabaseUrl}/rest/v1/rpc/${probe.name}`, {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify(probe.body),
     });
     const text = await res.text();
-    classifyProbeResult(`RPC ${probe.name}`, res.status, text, { failures, inconclusive, details });
+    classifyProbeResult(`RPC ${probe.name}`, confirmedExists, res.status, text, { failures, inconclusive, details });
   }
 
   // 2. 全9テーブルの GET が拒否されること
+  const tableExists = {};
   for (const table of ALL_TABLES) {
+    const confirmedExists = secretSchema.paths.has(`/${table}`);
+    tableExists[table] = confirmedExists;
     const res = await fetch(`${supabaseUrl}/rest/v1/${table}?select=*`, {
-      headers: buildAnonAuthHeaders(anonKey),
+      headers: buildApiKeyHeaders(anonKey),
     });
     const text = await res.text();
-    classifyProbeResult(`GET ${table}`, res.status, text, { failures, inconclusive, details });
+    classifyProbeResult(`GET ${table}`, confirmedExists, res.status, text, { failures, inconclusive, details });
   }
 
   // 3. stores への INSERT / UPDATE も拒否されること（admin_key_hash書き換え＝権限奪取の防止確認）
+  // storesの存在確認は直前の「2.」のGETループで既にsecretキーのスキーマから確認済みのため
+  // （tableExists.stores）、その結果を使い回す（secretキーへの追加リクエストは不要）。
+  const storesConfirmedExists = tableExists.stores === true;
   const insertRes = await fetch(`${supabaseUrl}/rest/v1/stores`, {
     method: 'POST',
     headers: { ...authHeaders, Prefer: 'return=representation' },
@@ -719,7 +827,11 @@ async function runAcV4({ supabaseUrl, anonKey }) {
     }),
   });
   const insertText = await insertRes.text();
-  classifyProbeResult('INSERT stores', insertRes.status, insertText, { failures, inconclusive, details });
+  classifyProbeResult('INSERT stores', storesConfirmedExists, insertRes.status, insertText, {
+    failures,
+    inconclusive,
+    details,
+  });
 
   // UPDATE: 実在しないUUIDを対象にする。権限（REVOKE）はテーブル単位で効くため、
   // 対象行が0件でも「文そのものが実行できるか」を確認するにはこれで十分。
@@ -731,7 +843,24 @@ async function runAcV4({ supabaseUrl, anonKey }) {
     body: JSON.stringify({ admin_key_hash: `should_never_land_${Date.now()}` }),
   });
   const updateText = await updateRes.text();
-  classifyProbeResult('UPDATE stores', updateRes.status, updateText, { failures, inconclusive, details });
+  classifyProbeResult('UPDATE stores', storesConfirmedExists, updateRes.status, updateText, {
+    failures,
+    inconclusive,
+    details,
+  });
+
+  // 【是正：AC-S14】anonで2xxが1件でも返っていれば（failuresに積まれている）、
+  // 他がinconclusiveであろうと関係なく必ず不合格として明示する。「拒否されたことを合格」と
+  // 判定するロジックを緩めすぎて2xxを見逃すことがないよう、こちらを優先して判定する。
+  if (failures.length > 0) {
+    return {
+      id,
+      label,
+      pass: false,
+      summary: `以下が拒否されず通ってしまいました: ${failures.join(', ')}`,
+      detail: details.join('\n    '),
+    };
+  }
 
   if (inconclusive.length > 0) {
     return {
@@ -739,7 +868,7 @@ async function runAcV4({ supabaseUrl, anonKey }) {
       label,
       pass: false,
       envError: true,
-      summary: `検証不能: 一部のプローブが404を返しました（対象が存在しない）: ${inconclusive.join(
+      summary: `検証不能: secretキーでも存在確認できなかった、または想定外のステータスが返ったプローブがあります: ${inconclusive.join(
         ', '
       )}。supabase/setup.sqlが適用されているか確認してください`,
       detail: details.join('\n    '),
@@ -749,8 +878,8 @@ async function runAcV4({ supabaseUrl, anonKey }) {
   return {
     id,
     label,
-    pass: failures.length === 0,
-    summary: failures.length === 0 ? '' : `以下が拒否されず通ってしまいました: ${failures.join(', ')}`,
+    pass: true,
+    summary: '',
     detail: details.join('\n    '),
   };
 }
@@ -1003,7 +1132,17 @@ async function main() {
     { id: 'AC-V1', label: '正しいコードで登録が完走', run: () => runAcV1({ supabase, buildApp, tagger }) },
     { id: 'AC-V2', label: '同時5本でも店舗は1件だけ', run: () => runAcV2({ supabase, buildApp, tagger }) },
     { id: 'AC-V3', label: '不正リクエストが枠を消費しない', run: () => runAcV3({ supabase, buildApp, createRateLimiter, tagger }) },
-    { id: 'AC-V4', label: 'anon からアクセスできない', run: () => runAcV4({ supabaseUrl, anonKey: process.env.SUPABASE_ANON_KEY }) },
+    {
+      id: 'AC-V4',
+      label: 'anon からアクセスできない',
+      run: () =>
+        runAcV4({
+          supabaseUrl,
+          anonKey: process.env.SUPABASE_ANON_KEY,
+          // 【AC-S13是正】RPC/テーブルの「存在確認」にsecretキーを使う（後述fetchSecretSchemaPaths）。
+          secretKey: process.env.SUPABASE_SERVICE_KEY,
+        }),
+    },
   ];
 
   if (preCleanupError) {
