@@ -10,12 +10,15 @@
  * 検証できていなかった。実際、独立監査（SECURITY_REVIEW_L5_FINAL2.md 中-1）は
  * テスト全通過をすり抜けるリリースブロッカー（RPC内の列名衝突）を発見している。
  * 本スクリプトは、ユーザーが用意した検証用Supabaseプロジェクト（本番とは別）に対して
- * 実際にRPCを実行し、次の4点を確認する。
+ * 実際にRPCを実行し、次の7点を確認する。
  *
  *   AC-V1: 正しい確認コードで店舗登録が完走する（500にならない＝中-1是正の確認）
  *   AC-V2: 正しいコードを同時5本投げても、作成される店舗は1件だけ（中-A是正の確認）
  *   AC-V3: 不正なボディを300回投げても、その後の正規リクエストが429にならない（中-B是正の確認）
  *   AC-V4: anonキーからRPC・全テーブルの読み書きができない（権限設定の確認）
+ *   AC-V5: 確認コードは5回間違えると失効する（SECURITY_REVIEW_L5_FINAL2.md 第8部 #5 の確認）
+ *   AC-V6: 確認コード再送の60秒クールダウンが効く（同 #6 の確認）
+ *   AC-V7: 同一メールアドレスは1時間に5通まで（同 #8 の確認）
  *
  * 【実行者】このスクリプトはユーザーが自分のPCで実行する（node scripts/verify-staging.js）。
  * 実機（Supabaseの鍵）が無い環境では実行できないため、ここでは構文チェックと
@@ -75,6 +78,34 @@
  *             secretキーでも存在確認できない場合のみ「検証不能」とする。
  * ============================================================================
  *
+ * ============================================================================
+ * 【追加3（AC-V5〜AC-V7の追加・2026-08-09）】
+ * AC-V1〜AC-V4合格後、SECURITY_REVIEW_L5_FINAL2.md 第8部（本番反映前チェックリスト）のうち
+ * まだ実機確認できていなかった #5・#6・#8 を追加する。既存のAC-V1〜V4・安全装置・後片付けは
+ * 一切変更していない（新規関数の追加とAC_DEFSへの追記のみ）。
+ *
+ *   AC-V5: 確認コードを5回間違えた後、正しいコードでも失敗する（失効の確認）。
+ *          consume_signup_attempt RPC（supabase/setup.sql）は attempts < p_max の行しか
+ *          UPDATEにヒットさせないため、5回消費した後は6回目が正しいコードでも
+ *          UPDATE自体が0行になり、ハッシュ照合にすら到達しない（ユニットテストでは
+ *          確認済みだが実DB未確認だった）。
+ *   AC-V6: request-codeの60秒クールダウン。時間を実際に待つ代わりに、pending_signupsの
+ *          created_atをservice_roleで61秒前に書き換えることで、経過時間の演出だけを
+ *          短時間で再現する（意図は各所のコメントに明記）。
+ *   AC-V7: 同一メールアドレスは1時間5通まで。AC-V6と同じcreated_at書き換え手法で
+ *          60秒クールダウンを回避しながら6回連続でrequest-codeを呼び、6回目だけが
+ *          429になることを確認する。
+ *
+ * 【呼び出し回数の管理】verify-codeにはIP単位の制限（10分20回・overridesで上書き不可）が
+ * あり、AC-V1(1回)+AC-V2(5回)+AC-V5(6回)=12回で上限20回に収まる。AC-V6・AC-V7は
+ * request-code（別エンドポイント・別のIP制限）を使うため、この20回には影響しない。
+ * ただしAC-V6・AC-V7はメール単位・グローバル単位の「本物の」レート制限枠を実際に消費する
+ * ため、不正リクエストが枠を消費しないことを検証するAC-V3より後に実行する（AC_DEFSの順序で
+ * 担保）。request-code側のIP単位制限（1時間10回）はAC-V6・AC-V7の検証対象ではないため、
+ * AC-V3と同じ手法でIP単位のリミッタだけを実質無制限に差し替え、メール単位・グローバル単位は
+ * 本物のリミッタのまま検証する。
+ * ============================================================================
+ *
  * 【安全装置】本番に対して誤実行されると、不要な店舗が作られたりレート制限の枠が
  * 消費されたりする。以下をすべて満たさない限り何もせず終了する。
  *   0. 接続先DBの app_config テーブルに environment='staging' の行が存在する
@@ -123,6 +154,29 @@ const AC_V3_INVALID_REQUEST_COUNT = 300;
 // 300回の不正リクエストより十分大きく、かつ通常のJS数値として安全な範囲。
 const AC_V3_LOOSE_IP_LIMIT_MAX_REQUESTS = 1_000_000;
 const AC_V3_LOOSE_IP_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間（値自体は上限が実質無制限なので意味を持たない）
+// 【AC-V6/AC-V7でも使い回す】request-codeのIP単位リミッタを緩めるための上限値・窓は
+// AC-V3のものと全く同じ性質（「検証対象ではない別の制限に触れないようにする」ため）なので、
+// 定数も共有する。
+
+// AC-V5: わざと間違ったコードを何回投げるか（L-5対策「5回で失効」に合わせる。
+// server.js の SIGNUP_CODE_MAX_ATTEMPTS と同じ値）。
+const AC_V5_WRONG_ATTEMPTS = 5;
+
+// AC-V6: request_signup_code RPC（supabase/setup.sql）の再送クールダウン秒数。
+// server.js の SIGNUP_CODE_RESEND_COOLDOWN_SECONDS と同じ値。
+const AC_V6_COOLDOWN_SECONDS = 60;
+// 【時間を待たずにクールダウンを検証する手法】created_atを何秒前に書き換えるか。
+// RPCの判定式 `p.created_at <= now() - (p_cooldown_seconds || ' seconds')::interval`
+// （supabase/setup.sql:276）はちょうど60秒だと境界値（<=なので理論上は60秒ちょうどで
+// 通過するはずだが、書き換え・比較の間の実行時間ゆらぎで境界を跨いでしまう可能性を
+// 排除するため）、確実に条件を満たすよう60秒より1秒多い61秒前にする。
+const AC_V6_REWIND_SECONDS = AC_V6_COOLDOWN_SECONDS + 1;
+
+// AC-V7: 同一メールアドレスへの1時間あたりの上限（server.js の
+// REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS と同じ値）。上限+1回目（6回目）が
+// 429になることを確認するため、合計で6回投げる。
+const AC_V7_EMAIL_LIMIT = 5;
+const AC_V7_TOTAL_REQUESTS = AC_V7_EMAIL_LIMIT + 1;
 
 // pending_signups に直接投入する行の有効期限。server.js の SIGNUP_CODE_TTL_MINUTES と同じ値。
 const PENDING_SIGNUP_TTL_MINUTES = 15;
@@ -182,6 +236,16 @@ function hashKeySame(key) {
 // このスクリプトがハッシュ化して直接DBに入れるので何でもよいが、実装を揃えておく）。
 function generateCode() {
   return String(crypto.randomInt(100000, 1000000));
+}
+
+// AC-V5用：正しいコードとは異なる6桁コードを生成する（わざと間違えるため）。
+// 衝突確率は900000分の1と極めて低いが、念のためcorrectCodeと一致したら引き直す。
+function generateWrongCode(correctCode) {
+  let candidate;
+  do {
+    candidate = generateCode();
+  } while (candidate === correctCode);
+  return candidate;
 }
 
 // 【高-2是正】今回の実行を識別するタグを英字のみで生成する。
@@ -383,6 +447,30 @@ async function insertPendingSignup(supabase, { email, name, code }) {
     throw new Error(`pending_signups への投入に失敗しました: ${error.message}`);
   }
   return data;
+}
+
+// 【AC-V6/AC-V7用】pending_signups.created_at を service_role で過去の時刻に書き換える。
+// 【重要・時間を待たずにクールダウンを検証する手法】request_signup_code RPC の60秒
+// クールダウンは pending_signups.created_at を起点に判定される（supabase/setup.sql:276）。
+// 実際に60秒待つのはユーザーの手動実行のたびに時間がかかり非現実的なため、
+// 「created_atを直接過去に書き換える」ことで、経過時間の演出だけを短時間で再現する。
+// これはアプリのAPIを経由しない、検証専用のservice_role直接操作であり、本番相当の
+// 挙動（時間経過でクールダウンが解ける）をそのまま踏襲して確認するためのショートカットに
+// すぎない（クールダウンの判定ロジック自体はRPC内の本物のSQLがそのまま実行される）。
+async function rewritePendingSignupCreatedAtToPast(supabase, { email, secondsAgo }) {
+  const pastIso = new Date(Date.now() - secondsAgo * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('pending_signups')
+    .update({ created_at: pastIso })
+    .eq('email', email)
+    .select('id, created_at');
+  if (error) {
+    throw new Error(`pending_signups.created_at の書き換えに失敗しました（email=${email}）: ${error.message}`);
+  }
+  if (!data || data.length === 0) {
+    throw new Error(`pending_signups.created_at の書き換え対象行が見つかりませんでした（email=${email}）`);
+  }
+  return data[0];
 }
 
 // --- AC-V1: 正しいコードで店舗登録が完走する（中-1是正の検証） ---
@@ -884,6 +972,263 @@ async function runAcV4({ supabaseUrl, anonKey, secretKey }) {
   };
 }
 
+// --- AC-V5: 確認コードは5回間違えると失効する（チェックリスト #5） ---
+// 手順：(1) 既知のコードでpending_signupsに1行投入 (2) わざと間違ったコードで5回叩く
+// （すべて失敗するはず） (3) その後、正しいコードで叩く (4) それでも失敗する（=失効）ことを
+// 確認する。途中の5回のどこかで成功してしまったら、それ自体が不合格（=総当たりが通る）。
+async function runAcV5({ supabase, buildApp, tagger }) {
+  const id = 'AC-V5';
+  const label = '確認コードは5回間違えると失効する';
+  const email = tagger.email('v5');
+  const name = tagger.name('v5');
+  const correctCode = generateCode();
+
+  await insertPendingSignup(supabase, { email, name, code: correctCode });
+
+  const app = buildApp({ supabase, sendSignupCodeEmail: dummySendEmail });
+  const { server, baseUrl } = await startServer(app);
+  try {
+    const wrongResults = [];
+    for (let i = 0; i < AC_V5_WRONG_ATTEMPTS; i++) {
+      const wrongCode = generateWrongCode(correctCode);
+      const res = await fetch(`${baseUrl}/api/signup/verify-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, code: wrongCode }),
+      });
+      wrongResults.push({ attempt: i + 1, status: res.status });
+    }
+
+    // 【重要】5回のうちどこかで成功(201)してしまったら、その時点で不合格として確定する。
+    const succeededEarly = wrongResults.find((r) => r.status === 201);
+    if (succeededEarly) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `誤ったコードの${succeededEarly.attempt}回目で登録が成功してしまいました（不合格・途中成功）`,
+        detail: `各回のステータス: ${JSON.stringify(wrongResults)}`,
+      };
+    }
+    const unexpectedWrongStatus = wrongResults.find((r) => r.status !== 400);
+    if (unexpectedWrongStatus) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `誤ったコードへの応答に期待した400以外が含まれていました（検証が成立していません）: ${JSON.stringify(
+          tally(wrongResults.map((r) => r.status))
+        )}`,
+        detail: `各回のステータス: ${JSON.stringify(wrongResults)}`,
+      };
+    }
+
+    // 5回間違えた直後、正しいコードでも失敗する（=失効している）はず。
+    const finalRes = await fetch(`${baseUrl}/api/signup/verify-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, code: correctCode }),
+    });
+    const finalBody = await finalRes.text();
+
+    if (finalRes.status === 201) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: '5回間違えた直後、正しいコードで登録が成功してしまいました（コードが失効していません・不合格）',
+        detail: `誤ったコード5回のステータス: ${JSON.stringify(wrongResults)}\n最終(正しいコード)レスポンス: HTTP ${finalRes.status} ${finalBody}`,
+      };
+    }
+    if (finalRes.status !== 400) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `5回失効後、正しいコードへの応答が期待した400ではなくHTTP ${finalRes.status}でした（検証が成立していません）`,
+        detail: `誤ったコード5回のステータス: ${JSON.stringify(wrongResults)}\n最終レスポンス本文: ${finalBody}`,
+      };
+    }
+
+    return {
+      id,
+      label,
+      pass: true,
+      summary: '',
+      detail: `誤ったコードを${AC_V5_WRONG_ATTEMPTS}回投げて全てHTTP 400（各回: ${JSON.stringify(
+        wrongResults
+      )}）だった後、正しいコードでもHTTP 400で拒否されました（5回失効を確認）`,
+    };
+  } finally {
+    await stopServer(server);
+  }
+}
+
+// --- AC-V6: 再送の60秒クールダウンが効く（チェックリスト #6） ---
+// 手順：(1) request-codeを1回呼ぶ（成功するはず） (2) すぐにもう一度呼ぶ→429を確認
+// (3) pending_signupsのcreated_atをservice_roleで61秒前に書き換える (4) もう一度呼ぶ→
+// 今度は成功することを確認する。
+async function runAcV6({ supabase, buildApp, createRateLimiter, tagger }) {
+  const id = 'AC-V6';
+  const label = '再送の60秒クールダウンが効く';
+  const email = tagger.email('v6');
+  const name = tagger.name('v6');
+
+  // 【検証の意図】AC-V6が確認したいのはrequest-codeの「クールダウン」だけである。
+  // 同エンドポイントには別のIP単位レート制限（1時間10通）もかかっており、AC-V6・AC-V7を
+  // 通しで実行すると無関係にそちらへ触れてしまう恐れがあるため、AC-V3と同じ手法で
+  // IP単位のリミッタだけを実質無制限にする。メール単位・グローバル単位のリミッタは
+  // 本物のまま使う（overridesを渡さない＝server.jsの本物のリミッタがそのまま使われる）。
+  const looseIpLimiter = createRateLimiter(AC_V3_LOOSE_IP_LIMIT_WINDOW_MS, AC_V3_LOOSE_IP_LIMIT_MAX_REQUESTS);
+  const app = buildApp({
+    supabase,
+    requestCodeIpLimiter: looseIpLimiter,
+    sendSignupCodeEmail: dummySendEmail,
+  });
+  const { server, baseUrl } = await startServer(app);
+  try {
+    const firstRes = await fetch(`${baseUrl}/api/signup/request-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email }),
+    });
+    const firstBody = await firstRes.text();
+    if (firstRes.status !== 200) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `1回目のrequest-codeが期待した200ではなくHTTP ${firstRes.status}でした（検証不能）`,
+        detail: `レスポンス本文: ${firstBody}`,
+      };
+    }
+
+    // すぐにもう一度呼ぶ → クールダウン中のため429になるはず
+    const secondRes = await fetch(`${baseUrl}/api/signup/request-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email }),
+    });
+    const secondBody = await secondRes.text();
+    if (secondRes.status !== 429) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `直後の2回目のrequest-codeが期待した429ではなくHTTP ${secondRes.status}でした（クールダウンが効いていない・不合格）`,
+        detail: `1回目: HTTP ${firstRes.status}\n2回目: HTTP ${secondRes.status} ${secondBody}`,
+      };
+    }
+
+    // 【時間を待たずにクールダウンを検証する手法】created_atを61秒前に書き換える
+    // （詳細な意図は rewritePendingSignupCreatedAtToPast のコメントを参照）。
+    await rewritePendingSignupCreatedAtToPast(supabase, { email, secondsAgo: AC_V6_REWIND_SECONDS });
+
+    const thirdRes = await fetch(`${baseUrl}/api/signup/request-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email }),
+    });
+    const thirdBody = await thirdRes.text();
+    if (thirdRes.status !== 200) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `created_atを${AC_V6_REWIND_SECONDS}秒前に書き換えた後の3回目が期待した200ではなくHTTP ${thirdRes.status}でした（不合格）`,
+        detail: `1回目: HTTP ${firstRes.status}\n2回目(即時): HTTP ${secondRes.status}\n3回目(${AC_V6_REWIND_SECONDS}秒前に書き換え後): HTTP ${thirdRes.status} ${thirdBody}`,
+      };
+    }
+
+    return {
+      id,
+      label,
+      pass: true,
+      summary: '',
+      detail: `1回目:HTTP 200 → 直後の2回目:HTTP 429(クールダウン中) → created_atを${AC_V6_REWIND_SECONDS}秒前に書き換え後の3回目:HTTP 200 を確認しました`,
+    };
+  } finally {
+    await stopServer(server);
+  }
+}
+
+// --- AC-V7: 同一メールアドレスは1時間に5通まで（チェックリスト #8） ---
+// 手順：AC-V6と同じ「created_atを過去に書き換える」手法で60秒クールダウンを回避しながら、
+// 同じメールアドレスで6回request-codeを呼ぶ。5回目までは成功し、6回目が429になることを確認する。
+// 【注意】このACはメール単位・グローバル単位の「本物の」レート制限枠を実際に消費する
+// （メール送信自体はダミー関数に差し替わっているため、実際のメールは飛ばない）。
+async function runAcV7({ supabase, buildApp, createRateLimiter, tagger }) {
+  const id = 'AC-V7';
+  const label = '同一メールアドレスは1時間に5通まで';
+  const email = tagger.email('v7');
+  const name = tagger.name('v7');
+
+  // AC-V6と同じ理由でIP単位のリミッタだけを実質無制限にする。
+  // メール単位・グローバル単位は検証対象そのものなので、本物のリミッタのまま使う。
+  const looseIpLimiter = createRateLimiter(AC_V3_LOOSE_IP_LIMIT_WINDOW_MS, AC_V3_LOOSE_IP_LIMIT_MAX_REQUESTS);
+  const app = buildApp({
+    supabase,
+    requestCodeIpLimiter: looseIpLimiter,
+    sendSignupCodeEmail: dummySendEmail,
+  });
+  const { server, baseUrl } = await startServer(app);
+  try {
+    const attempts = [];
+    for (let i = 0; i < AC_V7_TOTAL_REQUESTS; i++) {
+      // 2回目以降は、直前の呼び出しでpending_signupsに書き込まれたcreated_atを
+      // 【AC-V6と同じ手法で】61秒前に書き換えてから呼ぶ。そうしないと60秒クールダウンに
+      // 引っかかり、検証したいメール単位上限（5通/時）にそもそも到達できないため。
+      if (i > 0) {
+        await rewritePendingSignupCreatedAtToPast(supabase, { email, secondsAgo: AC_V6_REWIND_SECONDS });
+      }
+      const res = await fetch(`${baseUrl}/api/signup/request-code`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email }),
+      });
+      const bodyText = await res.text();
+      attempts.push({ attempt: i + 1, status: res.status, body: bodyText.slice(0, 200) });
+    }
+
+    const first5 = attempts.slice(0, AC_V7_EMAIL_LIMIT);
+    const sixth = attempts[AC_V7_EMAIL_LIMIT];
+
+    const nonOkAmongFirst5 = first5.filter((a) => a.status !== 200);
+    if (nonOkAmongFirst5.length > 0) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `${AC_V7_EMAIL_LIMIT}回目までに期待した200以外の応答が含まれていました（検証が成立していません）`,
+        detail: `各回: ${JSON.stringify(attempts)}`,
+      };
+    }
+    if (!sixth || sixth.status !== 429) {
+      return {
+        id,
+        label,
+        pass: false,
+        summary: `${AC_V7_TOTAL_REQUESTS}回目が期待した429ではなくHTTP ${
+          sixth ? sixth.status : '(未実行)'
+        }でした（メール単位上限が効いていない・不合格）`,
+        detail: `各回: ${JSON.stringify(attempts)}`,
+      };
+    }
+
+    return {
+      id,
+      label,
+      pass: true,
+      summary: '',
+      detail: `同一メールへ${AC_V7_TOTAL_REQUESTS}回要求し、${AC_V7_EMAIL_LIMIT}回目まではHTTP 200、${AC_V7_TOTAL_REQUESTS}回目はHTTP 429（上限超過）を確認しました。各回: ${JSON.stringify(
+        attempts
+      )}`,
+    };
+  } finally {
+    await stopServer(server);
+  }
+}
+
 // 【中-6是正】「不合格」（実装の欠陥の疑い）・「検証不能」（環境エラー。実装とは無関係）・
 // 「未実行」（前段の失敗により実施できなかった）を区別して表示する。
 function printSummary(results) {
@@ -1142,6 +1487,21 @@ async function main() {
           // 【AC-S13是正】RPC/テーブルの「存在確認」にsecretキーを使う（後述fetchSecretSchemaPaths）。
           secretKey: process.env.SUPABASE_SERVICE_KEY,
         }),
+    },
+    // 【追加3】AC-V5〜AC-V7。verify-codeのIP制限（10分20回・上書き不可）に対する
+    // AC-V1(1)+AC-V2(5)+AC-V5(6)=12回の呼び出し回数は、この順序（AC-V1・V2が先に実行済み）
+    // でも変わらない。AC-V6・AC-V7は本物のメール単位・グローバル単位の枠を消費するため、
+    // 不正リクエストが枠を消費しないことを検証するAC-V3より後（この配列順）に実行する。
+    { id: 'AC-V5', label: '確認コードは5回間違えると失効する', run: () => runAcV5({ supabase, buildApp, tagger }) },
+    {
+      id: 'AC-V6',
+      label: '再送の60秒クールダウンが効く',
+      run: () => runAcV6({ supabase, buildApp, createRateLimiter, tagger }),
+    },
+    {
+      id: 'AC-V7',
+      label: '同一メールアドレスは1時間に5通まで',
+      run: () => runAcV7({ supabase, buildApp, createRateLimiter, tagger }),
     },
   ];
 
