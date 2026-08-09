@@ -74,6 +74,13 @@ const STAFF_NAME_MAX_LENGTH = 20;
 // 退会処理でStripe解約後にDB操作が失敗した場合など、運営への問い合わせを案内する際の連絡先。
 const SUPPORT_EMAIL = 'support@daida-store.jp';
 
+// 通報（/api/report）を運営に知らせる通知メールの宛先。
+// 通報はreportsテーブルに保存されるだけでは運営が気づけない（本番でテスト通報を送っても
+// 誰も気づけなかった実例あり）ため、保存に成功したら必ずこの宛先へメールする。
+// 環境変数で上書きできるが、未設定時に宛先が空になって通知が飛ばなくなる事態を防ぐため、
+// 運営の問い合わせ窓口であるSUPPORT_EMAILへフォールバックする。
+const REPORT_NOTIFICATION_EMAIL = process.env.REPORT_NOTIFICATION_EMAIL || SUPPORT_EMAIL;
+
 // 通報API（/api/report）は管理者キーなしで誰でも呼べる仕様のため、荒らし対策として
 // 同一IPからの短時間の大量送信を制限する（利用規約 第13条の通報機能）。
 const REPORT_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
@@ -278,6 +285,56 @@ async function sendSignupCodeEmail(email, code) {
         <p>以下の確認コードを登録画面に入力してください（${SIGNUP_CODE_TTL_MINUTES}分間有効です）。</p>
         <p style="font-size:28px; font-weight:bold; letter-spacing:4px;">${code}</p>
         <p>心当たりがない場合は、このメールは破棄してください。</p>
+      `,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Resend API error: ${res.status} ${text}`);
+  }
+}
+
+// 通報通知メールの本文（HTML）に、通報対象・通報内容・通報者など利用者の自由入力文字列を
+// そのまま埋め込むため、埋め込み前に最低限のHTMLエスケープを行う。これを怠ると、
+// 通報内容にHTMLタグを仕込まれた場合に運営側のメール表示が崩れたり、意図しないリンク等が
+// 埋め込まれるおそれがある。
+function escapeHtml(value) {
+  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  return String(value == null ? '' : value).replace(/[&<>"']/g, (ch) => map[ch]);
+}
+
+// 通報（利用規約 第13条）がreportsテーブルに保存できたことを運営に知らせる通知メール。
+// 【背景】通報はDBに保存されるだけでは運営が気づけず、実際に本番でテスト通報を送っても
+// 誰も気づけない状態だった。第13条2項の「合理的な調査」を行うには、まず通報の発生に
+// 運営が気づける必要があるため、このメールで気づける状態にする。
+// sendSignupCodeEmailと同じ方式（Resendの/emails APIをSDKなしでfetchする素朴な実装。
+// Node18+のグローバルfetchを利用）で送る。
+// メールを見るだけで判断できるよう、通報内容をそのまま（escapeHtmlした上で）本文に載せる。
+// 送信元IPも含める（独立監査で「証跡が残らず虚偽通報を技術的に判別できない」（中-2）と
+// 指摘され、通報の真偽を運営が判断する材料として記録するようにした経緯がある。
+// ここで使うsourceIpは、reportsテーブルへの保存時に使ったのと同じ値を再利用するだけで、
+// このメール送信のために新たな取得を行うわけではない）。
+async function sendReportNotificationEmail({ receivedAt, target, content, reporter, storeId, sourceIp }) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: REPORT_NOTIFICATION_EMAIL,
+      subject: '【DAIDA+】通報を受け付けました',
+      html: `
+        <p>DAIDA+に新しい通報が届きました。内容をご確認のうえ、必要な調査をお願いします（利用規約 第13条2項）。</p>
+        <ul>
+          <li>受信日時: ${escapeHtml(receivedAt)}</li>
+          <li>通報対象: ${escapeHtml(target)}</li>
+          <li>通報内容: ${escapeHtml(content)}</li>
+          <li>通報者（自己申告・任意）: ${escapeHtml(reporter || '（未入力）')}</li>
+          <li>店舗ID: ${escapeHtml(storeId || '（未指定/該当する店舗なし）')}</li>
+          <li>送信元IP: ${escapeHtml(sourceIp)}</li>
+        </ul>
       `,
     }),
   });
@@ -564,6 +621,11 @@ function buildApp(overrides = {}) {
   // これにより、テストは実際に外部へメールを送信することなく、
   // 「送信が確定した」ことだけを検証できる（省略時＝本番は本物のsendSignupCodeEmailを使う）。
   const sendSignupCodeEmailFn = overrides.sendSignupCodeEmail || sendSignupCodeEmail;
+  // 通報の通知メール（Resend APIへの実際のfetch）も同様にテストから差し替え可能にする。
+  // これにより、テストは実際に外部へメールを送信することなく、
+  // 「メール送信が失敗しても通報の受付自体は201で成功すること」（AC-R3）を検証できる
+  // （省略時＝本番は本物のsendReportNotificationEmailを使う）。
+  const sendReportNotificationEmailFn = overrides.sendReportNotificationEmail || sendReportNotificationEmail;
 
   app.post('/api/signup/request-code', async (req, res) => {
     // 【L-5是正(2周目・中-1)】まずIP単位のレート制限を確認する。不正なボディであっても
@@ -1188,6 +1250,7 @@ function buildApp(overrides = {}) {
       const sourceIp = String(clientIp).slice(0, REPORT_SOURCE_IP_MAX_LENGTH);
       const userAgent = String(req.headers['user-agent'] || '').slice(0, REPORT_USER_AGENT_MAX_LENGTH);
 
+      const receivedAt = new Date().toISOString();
       const { error: insErr } = await supabase.from('reports').insert({
         store_id: linkedStoreId,
         reporter: reporter.trim() || null,
@@ -1197,6 +1260,31 @@ function buildApp(overrides = {}) {
         user_agent: userAgent,
       });
       if (insErr) throw insErr;
+
+      // 【最重要】通報の保存（上のinsert）はここまでで既に成功している。
+      // 以降のメール通知が失敗しても、通報の受付自体は成功（201）として扱う。
+      //
+      // 理由：ここでメール失敗を理由に500を返すと、利用者には「通報できなかった」ように
+      // 見えるのに、reportsテーブルには保存済みという食い違いが生まれる。利用者が
+      // 「失敗した」と思って通報をやり直せば、同じ内容がDBに重複して残ってしまう。
+      // 通報の受付（保存）とその通知（メール送信）は別の責務であり、通知の失敗は
+      // 受付そのものを失敗として扱う理由にはならない。
+      // そのため、メール送信は独立したtry/catchで囲み、失敗してもここでは何もエラーを
+      // 返さず、console.errorにだけ記録する（Renderのログで運営が追跡できるようにするため。
+      // 本エンドポイント自体は第13条3項により調査状況等を利用者に開示しない設計のため、
+      // レスポンスにメール送信の成否を含めることもしない）。
+      try {
+        await sendReportNotificationEmailFn({
+          receivedAt,
+          target: target.trim(),
+          content: content.trim(),
+          reporter: reporter.trim() || null,
+          storeId: linkedStoreId,
+          sourceIp,
+        });
+      } catch (mailErr) {
+        console.error('report notification email error:', mailErr);
+      }
 
       res.status(201).json({ message: '通報を受け付けました。内容を確認いたします。' });
     } catch (err) {
