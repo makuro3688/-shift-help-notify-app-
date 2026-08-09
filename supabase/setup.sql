@@ -341,3 +341,22 @@ alter default privileges for role postgres in schema public
 -- したがって、新しいテーブルを追加するときの守りは「上の revoke all on table の一覧に
 -- テーブル名を追記すること」である。これを忘れると、そのテーブルだけ anon から
 -- 読める状態になり得る。scripts/verify-staging-summary.sql の確認5で検出できる。
+
+-- 【低-5是正／2026-08-09】関数（RPC）についても、既定でanon/authenticatedへ
+-- 実行権限が付与されないようにする。
+--
+-- 【なぜ必要か】PostgreSQL は CREATE FUNCTION 時に EXECUTE 権限を PUBLIC へ自動付与する。
+-- Supabase では PostgREST 経由で anon から RPC を呼べるため、対策しないと
+-- 「新しく作った関数が、誰でも直接呼べる」状態になる。
+-- 実際に consume_signup_attempt がこの状態で、戻り値に code_hash を含んでいたため、
+-- anon キーからハッシュを取得して6桁コードをオフライン総当たりできる経路が存在した
+-- （2026-08-09 に計画担当が発見。上の revoke all on function で個別に塞いだ）。
+--
+-- 個別の revoke は「新しい関数を作るたびに追記する」手作業に依存しており、
+-- 忘れれば同じ穴が再発する。この alter 文はその再発を構造的に防ぐ。
+-- 以後、anon から呼ばせたい関数がある場合のみ、明示的に grant すること
+-- （暗黙に許可されるのではなく、明示的に許可する形にするのが目的）。
+--
+-- 既存の関数には影響しない（既定権限は「これから作られるもの」にのみ適用される）。
+alter default privileges for role postgres in schema public
+  revoke all on functions from anon, authenticated;
