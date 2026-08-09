@@ -617,6 +617,25 @@ function classifyProbeResult(name, status, bodyText, { failures, inconclusive, d
   details.push(`${name}: HTTP ${status}${rejected ? '（拒否・合格）' : '（成功してしまった・不合格！要即対応）'} 本文: ${bodyText.slice(0, 300)}`);
 }
 
+// 【是正：AC-V4がHTTP 401で検証不能になる不具合の修正】
+// Supabaseの新形式APIキー（`sb_publishable_...` / `sb_secret_...`）はJWTではない。
+// 公式ドキュメントにより、新形式キーを `Authorization: Bearer` に入れて送ると、
+// Supabase側がそれをJWTとして解釈しようとして失敗し、HTTP 401を返すことが明記されている
+// （"A common mistake is sending a publishable or secret key as a bearer token... This
+// will cause 401 errors." / "The new API keys are not JWTs. Instead, put API keys in
+// the apikey header."）。新形式キーは `apikey` ヘッダにのみ入れる必要がある。
+// 一方、旧形式のanonキー（`eyJ...` のJWT）は、role解決のために従来どおり
+// `apikey` と `Authorization: Bearer` の両方に入れる必要がある（PostgRESTの仕様）。
+// AC-V4内の全fetch（疎通確認・RPC・GET・INSERT・UPDATE）でヘッダ生成を統一するため、
+// この1関数にまとめ、キーの接頭辞（`sb_`かどうか）で自動判定する。
+function buildAnonAuthHeaders(anonKey, extraHeaders = {}) {
+  const isNewFormatKey = typeof anonKey === 'string' && anonKey.startsWith('sb_');
+  const baseHeaders = isNewFormatKey
+    ? { apikey: anonKey }
+    : { apikey: anonKey, Authorization: `Bearer ${anonKey}` };
+  return { ...baseHeaders, ...extraHeaders };
+}
+
 // --- AC-V4: anonキーからアクセスできない ---
 async function runAcV4({ supabaseUrl, anonKey }) {
   const id = 'AC-V4';
@@ -625,27 +644,32 @@ async function runAcV4({ supabaseUrl, anonKey }) {
   const failures = [];
   const inconclusive = [];
 
-  const authHeaders = {
-    apikey: anonKey,
-    Authorization: `Bearer ${anonKey}`,
-    'Content-Type': 'application/json',
-  };
+  const authHeaders = buildAnonAuthHeaders(anonKey, { 'Content-Type': 'application/json' });
 
   // 【中-4是正・前提確認】anonキーそのものが有効か、意図的に許可されているエンドポイント
   // （PostgRESTのルート）で疎通確認する。無効な鍵（貼り間違い・別プロジェクトの鍵など）だと
   // 以降の全プローブが401を返すため、「何も検証していないのに全部合格」という偽陽性が
   // 起こりうる（監査で指摘済み）。ここで弾ければ「不合格」ではなく「検証不能」として返す。
   const readinessRes = await fetch(`${supabaseUrl}/rest/v1/`, {
-    headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}` },
+    headers: buildAnonAuthHeaders(anonKey),
   });
   if (readinessRes.status !== 200) {
+    // 【是正：AC-S9】失敗理由が分かるよう、ステータスコードとレスポンス本文を表示する。
+    // 鍵の値そのものは決して出力しない（本文にヘッダの値が含まれることは無いが、
+    // 念のため鍵の変数はここでは一切文字列結合に使わない）。
+    let readinessBody = '';
+    try {
+      readinessBody = (await readinessRes.text()).slice(0, 500);
+    } catch {
+      readinessBody = '(レスポンス本文の取得に失敗しました)';
+    }
     return {
       id,
       label,
       pass: false,
       envError: true,
       summary: `anonキーがPostgRESTに受け付けられませんでした（HTTP ${readinessRes.status}）。SUPABASE_ANON_KEYが正しいか確認してください（検証不能）`,
-      detail: '',
+      detail: `疎通確認レスポンス本文（鍵の値は含みません）: ${readinessBody || '(空)'}`,
     };
   }
 
@@ -679,7 +703,7 @@ async function runAcV4({ supabaseUrl, anonKey }) {
   // 2. 全9テーブルの GET が拒否されること
   for (const table of ALL_TABLES) {
     const res = await fetch(`${supabaseUrl}/rest/v1/${table}?select=*`, {
-      headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}` },
+      headers: buildAnonAuthHeaders(anonKey),
     });
     const text = await res.text();
     classifyProbeResult(`GET ${table}`, res.status, text, { failures, inconclusive, details });
