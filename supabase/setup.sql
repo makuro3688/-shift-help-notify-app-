@@ -327,3 +327,17 @@ revoke all on table stores, pending_signups, supervisor_keys, subscriptions,
 -- 問題を、テーブル権限側でも恒久化しておく）。
 alter default privileges for role postgres in schema public
   revoke all on tables from anon, authenticated;
+-- 【2026-08-09 実機確認の結果】上のalter文は意図どおり効いている。
+-- staging で pg_default_acl を確認したところ、postgres の行から anon / authenticated が
+-- 消え、postgres と service_role だけが残る状態になっていた。
+--
+-- ただし Supabase は既定権限を postgres と supabase_admin の「2つの役割」で設定しており、
+-- supabase_admin の行には anon が残る。これは以下の理由で対処不要かつ対処不能である。
+--   ・既定権限は「テーブルを誰が作ったか」で決まる。SQL Editor で作れば作成者は postgres
+--     となるため、上のalter文が適用され anon には権限が付かない
+--   ・supabase_admin は Supabase 内部専用の役割で、利用者がテーブルを作る際には使われない
+--   ・supabase_admin の既定権限は権限不足で変更できない（permission denied）
+--
+-- したがって、新しいテーブルを追加するときの守りは「上の revoke all on table の一覧に
+-- テーブル名を追記すること」である。これを忘れると、そのテーブルだけ anon から
+-- 読める状態になり得る。scripts/verify-staging-summary.sql の確認5で検出できる。
