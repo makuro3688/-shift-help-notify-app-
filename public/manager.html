@@ -62,6 +62,12 @@
   .siteFooter { max-width: 480px; margin: 20px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
   .siteFooter a { color: #888; text-decoration: underline; }
   .reportLink { display: inline-block; margin-top: 10px; font-size: 13px; color: #888; cursor: pointer; text-decoration: underline; }
+  /* 管理者キー復旧（/api/recovery/*）用。signup.htmlの管理者キー表示と同じ扱い（警告・コピー欄）。 */
+  .linkBtn { background: none; color: #00a8ff; font-size: 13px; font-weight: normal; padding: 8px; margin-top: 8px; text-decoration: underline; width: 100%; border: none; cursor: pointer; }
+  .warn { background: #fff6e6; border: 1px solid #f5c96b; border-radius: 8px; padding: 14px; margin-top: 16px; font-size: 13px; text-align: left; line-height: 1.7; }
+  .keybox { display: flex; gap: 8px; margin-top: 6px; }
+  .keybox input { font-family: monospace; font-size: 13px; }
+  .keybox button { width: auto; padding: 10px 14px; margin-top: 0; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -79,6 +85,56 @@
   <input id="adminKeyInput" type="text" placeholder="管理者キーを入力" autocomplete="off">
   <button id="loginBtn" onclick="login()">ログイン</button>
   <div id="loginStatus" class="status"></div>
+  <button type="button" class="linkBtn" onclick="showRecovery()">🔑 管理者キーを忘れた方はこちら</button>
+</div>
+
+<!-- 管理者キー復旧（/api/recovery/*）。店舗登録時のメールアドレスに確認コードを送り、
+     入力させることで本人確認したうえで新しい管理者キーを発行する（旧キーは失効）。
+     新しいキーの表示はsignup.htmlの管理者キー表示と同じ扱い（.warn＝「閉じると二度と
+     表示されません」の警告）にする。 -->
+<div class="card" id="recoveryCard" style="display:none;">
+  <p class="brand">DAIDA+</p>
+  <h2>🔑 管理者キーの再発行</h2>
+
+  <div id="recoveryRequestArea">
+    <p style="color:#7f8c8d; font-size:14px;">店舗登録時に使用したメールアドレスを入力してください。ご登録のメールアドレスであれば、確認コードをお送りします。</p>
+    <label>メールアドレス</label>
+    <input id="recoveryEmailInput" type="email" placeholder="例：owner@example.com" autocomplete="email">
+    <button id="recoveryRequestBtn" onclick="requestRecoveryCode()">確認コードを送信</button>
+    <div id="recoveryRequestStatus" class="status"></div>
+    <button type="button" class="linkBtn" onclick="backToLoginFromRecovery()">ログイン画面に戻る</button>
+  </div>
+
+  <div id="recoveryCodeArea" style="display:none;">
+    <p id="recoveryCodeSentTo" style="color:#7f8c8d; font-size:14px;"></p>
+    <label>確認コード（6桁）</label>
+    <input id="recoveryCodeInput" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code">
+    <button id="recoveryVerifyBtn" onclick="verifyRecoveryCode()">確認して管理者キーを再発行</button>
+    <button type="button" class="linkBtn" onclick="requestRecoveryCode(true)">コードを再送する</button>
+    <div id="recoveryVerifyStatus" class="status"></div>
+    <p class="noteBox">⚠️ 再発行すると、<strong>現在の管理者キーは使えなくなります。</strong>時間帯責任者キー・登録スタッフ・募集履歴・ご契約状況はそのまま維持されます。</p>
+    <button type="button" class="linkBtn" onclick="backToLoginFromRecovery()">ログイン画面に戻る</button>
+  </div>
+
+  <div id="recoveryResultArea" style="display:none;">
+    <div class="warn">
+      ⚠️ 下の「新しい管理者キー」は<strong>この画面を閉じると二度と表示されません。</strong>必ずコピーして安全な場所に保存してください。<br><br>
+      <strong>古い管理者キーは、この操作により使えなくなりました。</strong>時間帯責任者キーはそのまま引き続きお使いいただけます。
+    </div>
+    <!-- 【中-6是正】管理者キーの「紛失」なら時間帯責任者キーを維持する判断で問題ないが、
+         「漏洩」の場合は、攻撃者が事前に発行した時間帯責任者キー（全スタッフへの配信権限）が
+         そのまま残り続ける。復旧完了画面で維持を「安心」させる方向の文言だけにせず、
+         漏洩の可能性がある場合の確認・失効の導線（既存の「時間帯責任者の管理」画面）へ誘導する。 -->
+    <div class="noteBox">
+      🔎 <strong>管理者キーが第三者に漏れた可能性がある場合は、</strong>時間帯責任者キーの心当たりも確認してください。ログイン後に表示される「👥 時間帯責任者の管理」から発行済みのキー一覧を確認し、身に覚えのないものは失効させてください（漏洩したキーで既に時間帯責任者キーが発行されていた場合、今回の再発行だけでは対処できません）。
+    </div>
+    <label>新しい管理者キー（店長用ダッシュボードのログインに使用）</label>
+    <div class="keybox">
+      <input id="recoveryAdminKeyOut" readonly>
+      <button onclick="copyField('recoveryAdminKeyOut')">コピー</button>
+    </div>
+    <button onclick="useRecoveredKey()">このキーでログインする</button>
+  </div>
 </div>
 
 <div id="dashboard" style="display:none;">
@@ -419,6 +475,132 @@ function copyStaffUrl() {
   el.select();
   el.setSelectionRange(0, 99999);
   navigator.clipboard.writeText(el.value).catch(() => document.execCommand('copy'));
+}
+
+// signup.htmlのcopyField()と同じ汎用コピー処理（管理者キー復旧の結果表示で使う）。
+function copyField(id) {
+  const el = document.getElementById(id);
+  el.select();
+  el.setSelectionRange(0, 99999);
+  navigator.clipboard.writeText(el.value).catch(() => document.execCommand('copy'));
+}
+
+// --- 管理者キー復旧（/api/recovery/*） ---
+// メールアドレス入力→確認コード入力→新しいキーの表示、という流れ。
+// サーバー側はメールアドレスが登録済みかどうかで応答（文言・ステータス・所要時間）を
+// 変えない設計（AC-K6）のため、この画面も「送信しました」だけを表示し、
+// 登録の有無を画面上で断定しない。
+let recoveryEmail = '';
+
+function showRecovery() {
+  document.getElementById('loginCard').style.display = 'none';
+  document.getElementById('recoveryCard').style.display = 'block';
+  document.getElementById('recoveryRequestArea').style.display = 'block';
+  document.getElementById('recoveryCodeArea').style.display = 'none';
+  document.getElementById('recoveryResultArea').style.display = 'none';
+  document.getElementById('recoveryRequestStatus').textContent = '';
+  document.getElementById('recoveryVerifyStatus').textContent = '';
+}
+
+function backToLoginFromRecovery() {
+  document.getElementById('recoveryCard').style.display = 'none';
+  document.getElementById('loginCard').style.display = 'block';
+}
+
+async function requestRecoveryCode(isResend) {
+  const btn = document.getElementById('recoveryRequestBtn');
+  const verifyBtn = document.getElementById('recoveryVerifyBtn');
+  const statusEl = document.getElementById('recoveryRequestStatus');
+  const verifyStatusEl = document.getElementById('recoveryVerifyStatus');
+
+  const email = isResend ? recoveryEmail : document.getElementById('recoveryEmailInput').value.trim();
+  if (!email) {
+    statusEl.textContent = 'メールアドレスを入力してください。';
+    return;
+  }
+
+  if (isResend) {
+    verifyBtn.disabled = true;
+    verifyStatusEl.textContent = '再送中...';
+  } else {
+    btn.disabled = true;
+    statusEl.textContent = '送信中...';
+  }
+
+  try {
+    const res = await fetch('/api/recovery/request-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '送信に失敗しました');
+
+    recoveryEmail = email;
+    document.getElementById('recoveryCodeSentTo').textContent =
+      data.message || `${email} が店舗登録済みの場合、確認コードを送信しました。`;
+    document.getElementById('recoveryRequestArea').style.display = 'none';
+    document.getElementById('recoveryCodeArea').style.display = 'block';
+
+    if (isResend) {
+      verifyStatusEl.textContent = '✅ 再送しました。';
+    } else {
+      document.getElementById('recoveryCodeInput').value = '';
+      statusEl.textContent = '';
+    }
+  } catch (err) {
+    if (isResend) {
+      verifyStatusEl.textContent = '❌ ' + err.message;
+    } else {
+      statusEl.textContent = '❌ ' + err.message;
+    }
+  } finally {
+    btn.disabled = false;
+    verifyBtn.disabled = false;
+  }
+}
+
+async function verifyRecoveryCode() {
+  const btn = document.getElementById('recoveryVerifyBtn');
+  const statusEl = document.getElementById('recoveryVerifyStatus');
+  const code = document.getElementById('recoveryCodeInput').value.trim();
+  if (!code) {
+    statusEl.textContent = '確認コードを入力してください。';
+    return;
+  }
+  btn.disabled = true;
+  statusEl.textContent = '確認中...';
+
+  try {
+    const res = await fetch('/api/recovery/verify-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: recoveryEmail, code }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '確認に失敗しました');
+
+    document.getElementById('recoveryAdminKeyOut').value = data.adminKey;
+    document.getElementById('recoveryCodeArea').style.display = 'none';
+    document.getElementById('recoveryResultArea').style.display = 'block';
+    // このタブの中だけで一時的に保持する（signup.htmlの管理者キー表示と同じ扱い。
+    // localStorage等には保存しない＝「閉じると二度と表示されません」を裏切らないため）。
+    window.__recoveredAdminKey = data.adminKey;
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 再発行された新しいキーで、そのままログイン画面に戻さずログイン処理まで行う利便性のための導線。
+function useRecoveredKey() {
+  const key = window.__recoveredAdminKey;
+  if (!key) return;
+  document.getElementById('recoveryCard').style.display = 'none';
+  document.getElementById('loginCard').style.display = 'block';
+  document.getElementById('adminKeyInput').value = key;
+  login();
 }
 
 // M-3 (AC-M3-7): 時間欄の入力から深夜帯（22時〜翌5時）にかかるかを判定し、

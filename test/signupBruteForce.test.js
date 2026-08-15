@@ -1035,6 +1035,47 @@ test('異常系(AC-L5-21・対比): alter default privilegesによる恒久化(�
 });
 
 // ============================================================
+// 【AC-KF3・中-2是正】setup.sqlを真っさらな環境で先頭から全文実行したとき、
+// `revoke all on table ... from anon, authenticated;` が実行される時点で、
+// revoke対象の全テーブルが既に create table if not exists 済みであること。
+//
+// 【背景】以前はkey_recovery_requestsのcreate table文が、このrevoke文より
+// ファイル内で後ろ（末尾の「管理者キー復旧機能」ブロック内）にあった。真っさらな
+// Supabaseプロジェクトで本ファイルを先頭から全文実行すると、revoke文の時点で
+// key_recovery_requestsがまだ存在せず `relation "key_recovery_requests" does not exist`
+// で失敗し、全体がロールバックしていた（新規環境限定の不具合。既存環境では既に
+// テーブルがあるため気づけなかった）。
+//
+// 上のAC-L5-21のテストは「revoke対象一覧に文字列として含まれているか」しか見ておらず、
+// ファイル内の出現順序（テーブル定義が先か、revokeが先か）を検証できていなかった
+// ため、この不具合を検出できなかった。このテストはその順序を直接検証する。
+// ============================================================
+test('正常系(AC-KF3・中-2是正): supabase/setup.sqlで、revoke対象の全テーブルがrevoke文より前に定義されている（新規環境での全文実行が失敗しないことの静的検証）', () => {
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'setup.sql'), 'utf8');
+
+  const revokeIdx = sql.indexOf('revoke all on table');
+  assert.ok(revokeIdx >= 0, 'revoke all on table 文が見つからない');
+
+  const tableDefs = [...sql.matchAll(/create table if not exists (\w+)/g)];
+  assert.ok(tableDefs.length > 0, 'テーブル定義が1つも見つからない(正規表現が壊れている可能性)');
+
+  for (const m of tableDefs) {
+    assert.ok(
+      m.index < revokeIdx,
+      `テーブル "${m[1]}" の定義(${m.index}文字目)が、revoke文(${revokeIdx}文字目)より後ろにある。` +
+        '真っさらな環境で本ファイルを先頭から全文実行すると、revoke文の時点でこのテーブルが' +
+        '存在せずエラーになり、全体がロールバックする（中-2と同じ不具合）'
+    );
+  }
+
+  // key_recovery_requestsが今回是正の対象だったテーブル。念のため名指しで確認する。
+  assert.ok(
+    tableDefs.some((m) => m[1] === 'key_recovery_requests'),
+    'key_recovery_requestsのcreate table文が見つからない(正規表現の見直しが必要)'
+  );
+});
+
+// ============================================================
 // 【低-1是正・静的検証】重複削除SQLがctidをタイブレーカに含んでいる
 // （created_at完全同値の重複行も削除できるようにする。ACなし・任意項目だが、
 // 監査人の修正案どおりに反映されていることを回帰検出できるようにしておく）

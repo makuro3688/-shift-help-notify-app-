@@ -18,6 +18,15 @@ const {
   SIGNUP_CODE_MAX_ATTEMPTS,
   SIGNUP_CODE_VERIFY_FAILED_MESSAGE,
 } = require('./lib/signup');
+// 管理者キー復旧（/api/recovery/*）。店舗登録とは別のテーブル・RPCを使う設計にした理由は
+// lib/keyRecovery.js冒頭のコメントを参照。
+const {
+  requestKeyRecoveryCode,
+  verifyKeyRecoveryCode,
+  KEY_RECOVERY_CODE_MAX_ATTEMPTS,
+  KEY_RECOVERY_VERIFY_FAILED_MESSAGE,
+  respondWithPadding,
+} = require('./lib/keyRecovery');
 
 const PORT = process.env.PORT || 3000;
 
@@ -59,6 +68,13 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'DAIDA+ <onboarding@resend.dev>';
 const SIGNUP_CODE_TTL_MINUTES = 15;
 const SIGNUP_CODE_RESEND_COOLDOWN_SECONDS = 60;
+
+// --- 管理者キー復旧（/api/recovery/*）関連の設定 ---
+// 管理者キーを失くすと店舗に二度と入れず、スタッフ全員に登録し直してもらう必要がある
+// （導入時の最大の壁を再び越えることになる）うえ、有料プラン契約中なら使えないのに
+// 引き落としだけ続く。店舗登録時のメールアドレス宛てに確認コードを送って本人確認したうえで
+// 新しい管理者キーを発行する。設計判断・列挙対策の詳細はlib/keyRecovery.js冒頭を参照。
+const KEY_RECOVERY_CODE_TTL_MINUTES = 15; // 店舗登録の確認コードと同じ有効期限
 
 // 無料期間：店舗登録から1か月間は配信回数の制限なし
 const FREE_TRIAL_MONTHS = 1;
@@ -178,6 +194,58 @@ const isRequestCodeAllowedByEmail = createRateLimiter(
   REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS
 );
 
+// 【管理者キー復旧】/api/recovery/verify-code のIP単位レート制限。
+// 考え方は/api/signup/verify-code（L-5是正）と全く同じ。総当たり対策の主軸はコード単位の
+// 試行回数制限（KEY_RECOVERY_CODE_MAX_ATTEMPTS）だが、複数のメールアドレスを横断して
+// 広く浅く総当たりする攻撃を止める補助として、同一IPからの試行回数にも上限を設ける。
+// 値は店舗登録のVERIFY_CODE_IP_RATE_LIMIT_*と同じ根拠のため、同じ値を採用する。
+const RECOVERY_VERIFY_CODE_IP_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
+const RECOVERY_VERIFY_CODE_IP_RATE_LIMIT_MAX_REQUESTS = 20; // 10分間に最大20回まで
+const isRecoveryVerifyCodeAllowedByIp = createRateLimiter(
+  RECOVERY_VERIFY_CODE_IP_RATE_LIMIT_WINDOW_MS,
+  RECOVERY_VERIFY_CODE_IP_RATE_LIMIT_MAX_REQUESTS
+);
+
+// 【管理者キー復旧】/api/recovery/request-code のレート制限（IP・メール・グローバルの3層）。
+// 店舗登録のrequest-code（REQUEST_CODE_*）と同じ3層構造・同じ根拠の数値を採用する
+// （「既存のものを再利用するほうが安全」という方針に基づき、実績のある値をそのまま流用する）。
+const RECOVERY_REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const RECOVERY_REQUEST_CODE_IP_RATE_LIMIT_MAX_REQUESTS = 10; // 1IPあたり1時間に10回まで
+const isRecoveryRequestCodeAllowedByIp = createRateLimiter(
+  RECOVERY_REQUEST_CODE_IP_RATE_LIMIT_WINDOW_MS,
+  RECOVERY_REQUEST_CODE_IP_RATE_LIMIT_MAX_REQUESTS
+);
+
+const RECOVERY_REQUEST_CODE_GLOBAL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const RECOVERY_REQUEST_CODE_GLOBAL_RATE_LIMIT_MAX_REQUESTS = 300; // サービス全体で1時間あたり最大300通まで
+const isRecoveryRequestCodeAllowedGlobally = createRateLimiter(
+  RECOVERY_REQUEST_CODE_GLOBAL_RATE_LIMIT_WINDOW_MS,
+  RECOVERY_REQUEST_CODE_GLOBAL_RATE_LIMIT_MAX_REQUESTS
+);
+const RECOVERY_REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY = 'global';
+
+// メールアドレス単位の上限。店舗登録のREQUEST_CODE_EMAIL_RATE_LIMIT_*と同じ値。
+// キーには生のメールアドレスではなくhashKey()した値を使う（下記ルート内で使用）。
+const RECOVERY_REQUEST_CODE_EMAIL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const RECOVERY_REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS = 5; // 同一メールアドレスへは1時間5通まで
+const isRecoveryRequestCodeAllowedByEmail = createRateLimiter(
+  RECOVERY_REQUEST_CODE_EMAIL_RATE_LIMIT_WINDOW_MS,
+  RECOVERY_REQUEST_CODE_EMAIL_RATE_LIMIT_MAX_REQUESTS
+);
+
+// 【管理者キー復旧・列挙対策（AC-K6）】メールアドレスが登録済みかどうかで応答時間が変わると、
+// 「このメールアドレスは店舗として登録されているか」を推測する材料（タイミングオラクル）に
+// なってしまう。登録済みの場合は実際にResend APIへの送信（ネットワーク往復）が発生し、
+// 未登録の場合は何もしない（往復が発生しない）ため、対策しなければ数百ms単位の
+// 顕著な差が生まれる。これを隠すため、DB照会〜メール送信までの区間の所要時間を、
+// 常にこの下限までパディングする（Resend APIの典型的な応答時間より余裕を持たせた値。
+// 実測に基づく厳密な値ではないため、疑わしきは長め＝安全側に倒している）。
+const KEY_RECOVERY_REQUEST_MIN_RESPONSE_TIME_MS = 400;
+// 検証（/api/recovery/verify-code）はDB照会のみで完結し、found/not-foundの処理量の差も
+// request-codeほど大きくない（外部ネットワーク呼び出しが無い）が、念のため同様の
+// パディングを適用する。値は小さめでよい。
+const KEY_RECOVERY_VERIFY_MIN_RESPONSE_TIME_MS = 100;
+
 // 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
 // ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
 const REPORT_SOURCE_IP_MAX_LENGTH = 64;
@@ -285,6 +353,38 @@ async function sendSignupCodeEmail(email, code) {
         <p>以下の確認コードを登録画面に入力してください（${SIGNUP_CODE_TTL_MINUTES}分間有効です）。</p>
         <p style="font-size:28px; font-weight:bold; letter-spacing:4px;">${code}</p>
         <p>心当たりがない場合は、このメールは破棄してください。</p>
+      `,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Resend API error: ${res.status} ${text}`);
+  }
+}
+
+// Resendを使って管理者キー復旧の確認コードメールを送る（sendSignupCodeEmailと同じ方式）。
+// 本人が要求していない場合に気づけるよう、「心当たりがない場合は破棄してください」の一文を
+// 必ず含める（何もしなければキーは変わらないことも明記し、慌てさせない）。
+// storeNameはユーザーが店舗登録時に自由入力した値のため、HTMLメール本文に埋め込む前に
+// escapeHtmlする（通報通知メールと同じ理由。タグ等を仕込まれても表示が壊れないようにする）。
+async function sendKeyRecoveryCodeEmail(email, code, storeName) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: email,
+      subject: 'DAIDA+ 管理者キーの再発行 確認コード',
+      html: `
+        <p>「${escapeHtml(storeName)}」の管理者キー再発行のご依頼を受け付けました。</p>
+        <p>以下の確認コードを画面に入力してください（${KEY_RECOVERY_CODE_TTL_MINUTES}分間有効です）。</p>
+        <p style="font-size:28px; font-weight:bold; letter-spacing:4px;">${code}</p>
+        <p><strong>このコードを入力すると、現在の管理者キーは無効になり、新しい管理者キーが発行されます。</strong>時間帯責任者キーはそのまま引き続きお使いいただけます。</p>
+        <p>この操作に心当たりがない場合は、このメールを破棄してください。何もしなければ管理者キーは変更されません。</p>
+        <p><strong>管理者キーが第三者に漏れた可能性がある場合は、</strong>時間帯責任者キーの再発行だけでは対処できません。ログイン後、店長用ダッシュボードの「時間帯責任者の管理」から発行済みのキー一覧を確認し、心当たりのないものは失効させてください。</p>
       `,
     }),
   });
@@ -627,6 +727,24 @@ function buildApp(overrides = {}) {
   // （省略時＝本番は本物のsendReportNotificationEmailを使う）。
   const sendReportNotificationEmailFn = overrides.sendReportNotificationEmail || sendReportNotificationEmail;
 
+  // 管理者キー復旧（/api/recovery/*）のレート制限器・メール送信・応答パディングの下限も、
+  // 上記と同じ理由でoverridesから差し替え可能にする（省略時＝本番の挙動は一切変わらない）。
+  const recoveryRequestCodeIpLimiter = overrides.recoveryRequestCodeIpLimiter || isRecoveryRequestCodeAllowedByIp;
+  const recoveryRequestCodeEmailLimiter = overrides.recoveryRequestCodeEmailLimiter || isRecoveryRequestCodeAllowedByEmail;
+  const recoveryRequestCodeGlobalLimiter = overrides.recoveryRequestCodeGlobalLimiter || isRecoveryRequestCodeAllowedGlobally;
+  const recoveryVerifyCodeIpLimiter = overrides.recoveryVerifyCodeIpLimiter || isRecoveryVerifyCodeAllowedByIp;
+  const sendKeyRecoveryCodeEmailFn = overrides.sendKeyRecoveryCodeEmail || sendKeyRecoveryCodeEmail;
+  // AC-K6のタイミング対策の下限値。テストは通常0を注入して高速化するが、本番は必ず
+  // 上のモジュールスコープの値（400ms/100ms）を使う。
+  const keyRecoveryRequestMinResponseTimeMs =
+    overrides.keyRecoveryRequestMinResponseTimeMs != null
+      ? overrides.keyRecoveryRequestMinResponseTimeMs
+      : KEY_RECOVERY_REQUEST_MIN_RESPONSE_TIME_MS;
+  const keyRecoveryVerifyMinResponseTimeMs =
+    overrides.keyRecoveryVerifyMinResponseTimeMs != null
+      ? overrides.keyRecoveryVerifyMinResponseTimeMs
+      : KEY_RECOVERY_VERIFY_MIN_RESPONSE_TIME_MS;
+
   app.post('/api/signup/request-code', async (req, res) => {
     // 【L-5是正(2周目・中-1)】まずIP単位のレート制限を確認する。不正なボディであっても
     // 同一IPからの大量送信自体は早期に弾いておきたいため、ここは従来どおりバリデーション前に行う。
@@ -798,6 +916,171 @@ function buildApp(overrides = {}) {
     } catch (err) {
       console.error('verify-code error:', err);
       res.status(500).json({ error: '店舗の作成に失敗しました' });
+    }
+  });
+
+  // 管理者キー復旧 手順1：店舗登録時のメールアドレス宛てに6桁の確認コードを送る。
+  // 【AC-K6・最重要】メールアドレスが実際に店舗登録済みかどうかで、応答（文言・ステータス・
+  // 所要時間）が変わってはならない。これが崩れると、攻撃者がメールアドレスを次々に試すだけで
+  // 「そのメールアドレスが店舗として登録されているか」を外部から判定できてしまう
+  // （＝どの企業がこのサービスを契約しているかを割り出せる列挙攻撃）。
+  // そのため、このハンドラは「登録済み/未登録」で分岐する処理（DB照会・メール送信）を
+  // try節の中に閉じ込め、例外が起きてもログに残すだけでクライアントへの応答は変えない。
+  app.post('/api/recovery/request-code', async (req, res) => {
+    // IP単位のレート制限（登録の有無に関係なく、純粋にIPからの要求頻度だけで判定するため、
+    // ここで429を返しても列挙のオラクルにはならない）。
+    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+    if (!recoveryRequestCodeIpLimiter(clientIp)) {
+      return res
+        .status(429)
+        .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
+    }
+
+    const email = ((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!isValidEmail(email)) {
+      // メール形式の妥当性は、店舗として登録されているかどうかとは無関係の判定のため、
+      // ここで400を返してもAC-K6には抵触しない（店舗登録のrequest-codeと同じ扱い）。
+      return res.status(400).json({ error: '正しいメールアドレスを入力してください' });
+    }
+    if (!RESEND_API_KEY) {
+      return res.status(500).json({ error: 'メール認証機能が設定されていません（管理者にお問い合わせください）' });
+    }
+
+    // メール単位・グローバル単位のレート制限は、形式チェックを通過した後（＝不正なボディでは
+    // 消費されない。店舗登録の独立再監査 中-B是正と同じ考え方）、かつ「登録済みかどうか」を
+    // 調べる前（＝登録済み/未登録で消費有無に差が出ない。AC-K6）に行う。
+    if (
+      !recoveryRequestCodeEmailLimiter(hashKey(email)) ||
+      !recoveryRequestCodeGlobalLimiter(RECOVERY_REQUEST_CODE_GLOBAL_RATE_LIMIT_KEY)
+    ) {
+      console.error('[ALERT] recovery request-code rate limit reached at send time (email or global cap)');
+      return res
+        .status(429)
+        .json({ error: '確認コードの送信要求が多すぎます。しばらくしてから再度お試しください' });
+    }
+
+    // ここから先はDB照会のみの区間（登録済み/未登録で処理量・所要時間が変わりうる）。
+    // 応答を返す直前に、この区間の所要時間を一定の下限までパディングする（AC-K6）。
+    // 【中-4是正】メール送信（Resend APIへのHTTPS往復）はこの区間に含めない。padUntilは
+    // あくまで「下限」であり、Resendの応答がその下限を超えると登録済み側だけが必ず遅くなり
+    // タイミング差が復活してしまう（既存の下限200msちょうどのテストでは検出できない穴だった）。
+    // 根本策として、メール送信は応答を返した後の非同期処理にし、送信の所要時間が
+    // 応答時間に一切影響しないようにする。
+    const dbPhaseStartedAt = Date.now();
+    let code = null;
+    let storeId = null;
+    let storeName = null;
+    try {
+      // 6桁コードの生成ロジックは店舗登録（generateSignupCode）と共用する
+      // （暗号学的乱数生成という点で用途を問わない汎用ロジックのため）。
+      code = generateSignupCode();
+      const expiresAt = new Date(Date.now() + KEY_RECOVERY_CODE_TTL_MINUTES * 60 * 1000).toISOString();
+
+      const result = await requestKeyRecoveryCode({
+        supabase,
+        email,
+        codeHash: hashKey(code),
+        expiresAt,
+      });
+      storeId = result.storeId;
+      storeName = result.storeName;
+    } catch (err) {
+      // 【AC-K6・重要】DB照会が失敗しても、クライアントへの応答は変えない。運用者が
+      // 気づけるよう、ログにだけ詳細を残す。
+      console.error('recovery request-code error (response intentionally unchanged to avoid enumeration):', err);
+    }
+
+    // 登録済み・未登録・内部エラーのいずれであっても、常にこの同一の文言・ステータス(200)を返す。
+    await respondWithPadding(res, dbPhaseStartedAt, keyRecoveryRequestMinResponseTimeMs, 200, {
+      message: `${email} が店舗登録済みの場合、確認コードを送信しました。メールをご確認ください（届かない場合は迷惑メールフォルダもご確認ください）。`,
+    });
+
+    // storeIdがある（＝登録済み）場合のみ実際にメールを送る。無い場合は何もしない。
+    // 【中-4是正・AC-KF4】応答を返した後に送る。setImmediateで次のイベントループへ回すことで、
+    // 応答の送信(res.json)が確実に処理された後にメール送信を開始する。
+    if (storeId) {
+      setImmediate(() => {
+        sendKeyRecoveryCodeEmailFn(email, code, storeName).catch((e) => {
+          // 【AC-KF5】応答は既に返却済みのため、送信に失敗しても復旧要求そのものの成否には
+          // 影響しない（列挙対策の維持）。中-1と同じ「利用者には成功と表示されるのに実際は
+          // メールが届かない」という沈黙した不発を運用者が把握できるよう、ログに残す。
+          console.error('[ALERT] recovery request-code email send failed (response already sent):', e);
+        });
+      });
+    }
+  });
+
+  // 管理者キー復旧 手順2：確認コードを照合し、正しければ新しい管理者キーを発行する。
+  // - 【AC-K2・核心】新しいキーの発行はINSERTではなくUPDATE（stores.admin_key_hashの上書き）。
+  //   これにより旧キーのハッシュは同じ1文で消え、以後requireAdminは旧キーで一致しなくなる。
+  // - 【AC-K3】supervisor_keysテーブルには一切触れない。時間帯責任者キーはオーナーが
+  //   管理者キーを失くしたこととは無関係に有効であり続けるべきだから。
+  // - 【AC-K4】UPDATEの対象列はadmin_key_hashのみ。スタッフ(subscriptions)・募集履歴(shifts)・
+  //   課金状態（subscription_status等の他の列）には一切触れない。
+  app.post('/api/recovery/verify-code', async (req, res) => {
+    // まずIP単位のレート制限を確認する（店舗登録のverify-codeと同じ考え方）。
+    const clientIp = req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+    if (!recoveryVerifyCodeIpLimiter(clientIp)) {
+      return res
+        .status(429)
+        .json({ error: '短時間に確認コードの試行が多く行われています。しばらくしてから再度お試しください' });
+    }
+
+    const email = ((req.body && req.body.email) || '').trim().toLowerCase();
+    const code = ((req.body && req.body.code) || '').trim();
+    if (!email || !code) {
+      return res.status(400).json({ error: 'メールアドレスと確認コードを入力してください' });
+    }
+
+    const verifyPhaseStartedAt = Date.now();
+    try {
+      // 【中核】単一の原子的なSQL関数(consume_key_recovery_attempt)で、試行枠の消費・
+      // 定数時間でのハッシュ照合・一致時の即時削除までを不可分に行う（consume_signup_attemptと
+      // 同じ設計。AC-K5：同時に何件リクエストが来ても、1コードにつき照合に進める回数は
+      // 厳密にKEY_RECOVERY_CODE_MAX_ATTEMPTS回に制限され、検証成功は構造的に高々1回しか
+      // 起こらない）。
+      const result = await verifyKeyRecoveryCode({
+        supabase,
+        email,
+        code,
+        hashCode: hashKey,
+        maxAttempts: KEY_RECOVERY_CODE_MAX_ATTEMPTS,
+      });
+
+      if (!result.ok) {
+        // 該当なし・期限切れ・上限到達（失効）・コード不一致のいずれであっても同一の文言を返す。
+        return respondWithPadding(res, verifyPhaseStartedAt, keyRecoveryVerifyMinResponseTimeMs, 400, {
+          error: KEY_RECOVERY_VERIFY_FAILED_MESSAGE,
+        });
+      }
+
+      // ここに到達した時点で、確認コードは既にconsume_key_recovery_attempt RPCの内部で
+      // 消費（該当行を削除）済み。したがって、これ以降のキー更新に失敗しても、
+      // 利用者は同じコードでやり直すことができない（コードは1回限りという設計上の
+      // トレードオフ。signup側のverify-codeと同じ扱い）ため、再送を案内する。
+      try {
+        const newAdminKey = generateAdminKey();
+        const { error: updateErr } = await supabase
+          .from('stores')
+          .update({ admin_key_hash: hashKey(newAdminKey) })
+          .eq('id', result.storeId);
+        if (updateErr) throw updateErr;
+
+        return respondWithPadding(res, verifyPhaseStartedAt, keyRecoveryVerifyMinResponseTimeMs, 200, {
+          adminKey: newAdminKey,
+        });
+      } catch (updateErr) {
+        console.error('recovery verify-code key update error (code already consumed):', updateErr);
+        return respondWithPadding(res, verifyPhaseStartedAt, keyRecoveryVerifyMinResponseTimeMs, 500, {
+          error:
+            '確認は完了しましたが、管理者キーの更新に失敗しました。お手数ですが、確認コードの送信からやり直してください',
+        });
+      }
+    } catch (err) {
+      console.error('recovery verify-code error:', err);
+      return respondWithPadding(res, verifyPhaseStartedAt, keyRecoveryVerifyMinResponseTimeMs, 500, {
+        error: '管理者キーの復旧に失敗しました',
+      });
     }
   });
 

@@ -105,6 +105,26 @@ create table if not exists reports (
   created_at timestamptz not null default now()
 );
 
+-- 管理者キー復旧の確認コードを一時的に保持するテーブル。
+-- store_idに一意インデックスを張ることで「1店舗につき有効な復旧コードは常に1つ」に保つ
+-- （新しいコードを要求すると、同じ店舗の古いコードは上書きされ、実質的に失効する）。
+-- 【中-2是正】以前はこのテーブル定義が本ファイル末尾の「管理者キー復旧機能」ブロック内に
+-- あり、anon/authenticatedからのrevoke一覧（本ファイル前半）より後ろにあった。真っさらな
+-- Supabaseプロジェクトで本ファイルを先頭から全文実行すると、revoke文が「このテーブルは
+-- まだ存在しない」状態で実行されて `relation "key_recovery_requests" does not exist` に
+-- なり、全体がロールバックしていた（新規環境限定の不具合）。他のテーブルと同じく
+-- ファイル前半（create table群の中）に定義することで、revokeより必ず先に存在するようにする。
+create table if not exists key_recovery_requests (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references stores(id) on delete cascade,
+  email text not null, -- 要求時にstoresと照合したメールアドレス（証跡用途。認可はstore_idで行う）
+  code_hash text not null, -- 6桁確認コードのSHA-256ハッシュ。生のコードはDBに保存しない
+  expires_at timestamptz not null,
+  attempts integer not null default 0, -- 検証失敗回数。KEY_RECOVERY_CODE_MAX_ATTEMPTS(5)に達すると失効
+  created_at timestamptz not null default now()
+);
+create unique index if not exists key_recovery_requests_store_id_key on key_recovery_requests (store_id);
+
 -- 既存環境（この列追加前に作成されたDB）向けのマイグレーション。
 -- create table if not exists は既存テーブルには列を追加しないため、明示的にALTERする。
 alter table reports add column if not exists source_ip text;
@@ -318,9 +338,13 @@ grant execute on function request_signup_code(text, text, text, timestamptz, int
 --
 -- この一覧は本ファイルに定義されている全テーブル（stores, supervisor_keys,
 -- pending_signups, subscriptions, shifts, app_config, stripe_events, used_emails,
--- reports）を網羅している。新しいテーブルを追加した場合は、ここにも追記すること。
+-- reports, key_recovery_requests）を網羅している。新しいテーブルを追加した場合は、
+-- ここにも追記すること（key_recovery_requestsは管理者キー復旧機能で追加。テーブル定義自体は
+-- 上のreportsテーブルの直後にある。中-2是正で、revoke対象のテーブルは必ずこのrevoke文より
+-- 前で定義するようにしている）。
 revoke all on table stores, pending_signups, supervisor_keys, subscriptions,
-                    shifts, app_config, stripe_events, used_emails, reports
+                    shifts, app_config, stripe_events, used_emails, reports,
+                    key_recovery_requests
   from anon, authenticated;
 -- 将来追加されるテーブルにも、既定でanon/authenticatedへ権限が付与されないようにする
 -- （低-2で指摘された「関数のEXECUTE権限が再作成のたびに手動運用に依存する」のと同種の
@@ -360,3 +384,187 @@ alter default privileges for role postgres in schema public
 -- 既存の関数には影響しない（既定権限は「これから作られるもの」にのみ適用される）。
 alter default privileges for role postgres in schema public
   revoke all on functions from anon, authenticated;
+
+-- ============================================================================
+-- 管理者キー復旧機能（/api/recovery/*）：新規テーブル・RPCの追加。
+-- 【重要】このブロックは自動で反映されません。本番・staging とも
+-- Supabase の SQL Editor で手動実行してください。
+-- 実行が必要な範囲は2箇所：
+--   1. 本ファイル前半の「revoke all on table stores, ...」文（低-3是正のブロック内。
+--      key_recovery_requestsを追記済み。この1文だけを再実行すればよい）
+--   2. このブロック（RPC作成〜権限設定。テーブル本体はcreate table if not exists
+--      key_recovery_requestsとして本ファイル前半・reportsテーブルの直後に移動済み。中-2是正）
+-- 【中-2是正】本ファイルを新規環境（真っさらなSupabaseプロジェクト）で先頭から全文実行しても
+-- 害はない。以前はテーブル定義がこのブロック内にあり、revoke文（本ファイル前半）より後ろに
+-- 来ていたため、新規環境では「テーブルがまだ存在しない」状態でrevokeが実行されて失敗して
+-- いた（既存環境では既にテーブルがあるため気づけなかった）。テーブル定義を前半へ移した今は、
+-- 新規環境・既存環境のどちらで全文を再実行しても、下記はすべて冪等（create table if not
+-- exists / create or replace function / 単純なrevoke）であり、害はない。
+--
+-- 店舗登録用の pending_signups テーブル・consume_signup_attempt / request_signup_code
+-- RPCとは意図的に別のテーブル・別の関数にしている（詳しい理由はlib/keyRecovery.js冒頭の
+-- コメントを参照）。要点：
+--   - pending_signups.email は一意インデックスのため、店舗登録の途中と管理者キー復旧の
+--     途中が同じメールアドレスで重なると、片方の保留行がもう片方を上書きしてしまう
+--     （「復旧のつもりが新規登録になる」「新規登録のコードで復旧できる」の取り違え）。
+--   - pending_signups.name（NOT NULL、これから作る店舗名の意味）は復旧の意味と異なる。
+--   - テーブルを完全に分けることで、取り違えが構造的に起こり得なくなる
+--     （用途を区別する列(purpose等)を1つのテーブルに足す案は、WHERE句の書き忘れで
+--     同じ取り違えが再発しうるため採らなかった）。
+-- 一方、「原子的なRPCで試行回数・確認コードを扱う」という設計パターン自体は
+-- pending_signups / consume_signup_attempt / request_signup_code から踏襲している。
+--
+-- 【2026-08-09に適用済みの既定権限revokeとの関係】
+--   alter default privileges for role postgres in schema public
+--     revoke all on tables from anon, authenticated;
+--   alter default privileges for role postgres in schema public
+--     revoke all on functions from anon, authenticated;
+-- が既に適用されているため、以下で新規作成するテーブル・関数にも、デフォルトでは
+-- anon/authenticatedへの権限は付与されない。ただし、この事実に暗黙に依存せず、
+-- 既存のconsume_signup_attempt等と同じく明示的にrevoke/grantも行う（多層防御・可読性）。
+-- ============================================================================
+
+-- key_recovery_requestsのテーブル本体は本ファイル前半（reportsテーブルの直後）に
+-- 定義済み（中-2是正）。ここには置かない。
+
+-- 管理者キー復旧 手順1：メールアドレスから対象店舗を特定し、確認コードの保留行を発行する。
+-- 【列挙対策の核】メールアドレスが実在する店舗のものかどうかで、この関数の戻り値
+-- （store_idの有無）は当然変わるが、それをどう応答するか（HTTPレスポンスの文言・
+-- ステータス・所要時間を完全に同一にするかどうか）は呼び出し側(server.js)の責務。
+-- この関数はその判断材料（実際にメールを送ってよいか）を渡すだけに徹する。
+--
+-- 【あえてクールダウン(WHERE句によるゲート)を設けていない理由】
+-- request_signup_codeは「直近送信からcooldown秒未満なら更新しない」というWHERE句で
+-- 429を返せるようにしているが、この関数でクールダウン中かどうかを呼び出し側に返すと、
+-- 「このメールは登録済みで、かつ直近に要求した」という情報の漏洩経路になる
+-- （未登録メールは絶対にクールダウン状態にならないため、応答の違いが列挙の手がかりになる）。
+-- 連続送信の抑制は、呼び出し側が実際に送信する前に必ず通す、メールアドレス単位・
+-- グローバル単位のインメモリレート制限（server.js、lib/rateLimit.js。登録の有無に
+-- かかわらず同じ基準で動く）で行う。この関数は常に無条件で上書き（＝古いコードを即座に
+-- 失効させて新しいコードを発行）する。
+-- 【中-1是正・リリースブロッカー】RETURNS TABLEのOUTパラメータ名は「store_id」「store_name」
+-- ではなく「out_store_id」「out_store_name」にする（テーブル列名と衝突しない名前にする）。
+-- 理由：RETURNS TABLE (store_id uuid, ...) と書くと、plpgsqlは"store_id"という名前の
+-- PL/pgSQL変数を作る。ところが下のINSERT文にある `on conflict (store_id)` の
+-- `store_id` は、パーサ内部でColumnRefに変換されてtransformExpr()に通される（＝ただの
+-- 列名ではなく式として解決される）ため、plpgsqlのcolumnrefフックが働き、
+-- key_recovery_requests.store_id列（実在する列）とPL/pgSQL変数storeidのどちらとも解釈でき
+-- 曖昧になる。既定の`plpgsql.variable_conflict = error`の下では
+-- 「column reference "store_id" is ambiguous」（SQLSTATE 42702）で毎回失敗する。
+-- INSERTの列リスト側（(store_id, email, ...)）は式として解決されないため安全だが、
+-- ON CONFLICTの推定句だけがこの罠にかかる。
+-- 未登録メールはINSERTに到達しないため気づかれず、登録済みメールでだけ必ず失敗する
+-- （＝確認コードの発行が全ユーザーに対して沈黙したまま不発になる）。
+-- `#variable_conflict use_column`という暗黙のルールに頼る回避策は採らず、名前そのものを
+-- 明示的にテーブル列名と衝突しないものに変える（L-5是正以来の方針）。
+create or replace function request_key_recovery_code(
+  p_email text,
+  p_code_hash text,
+  p_expires_at timestamptz
+) returns table (out_store_id uuid, out_store_name text)
+language plpgsql
+as $$
+declare
+  v_store_id uuid;
+  v_store_name text;
+begin
+  -- 同じメールアドレスが複数店舗に紐づく（本来想定していないが、stores.emailに一意制約が
+  -- 無いため技術的には起こりうる）場合は、最も新しく作成された店舗を対象にする。
+  -- request_key_recovery_codeとconsume_key_recovery_attemptの両方で同じ選び方
+  -- （created_at降順で1件）を使うことで、要求時と検証時で対象店舗がねじれないようにする。
+  select id, name into v_store_id, v_store_name
+    from stores
+   where email = p_email
+   order by created_at desc
+   limit 1;
+
+  if v_store_id is null then
+    -- 未登録メール：行を作らずに空を返す。呼び出し側はメール送信をスキップするが、
+    -- クライアントへの応答は登録済みの場合と同一にする（AC-K6）。
+    return;
+  end if;
+
+  insert into key_recovery_requests as k (store_id, email, code_hash, expires_at, attempts)
+  values (v_store_id, p_email, p_code_hash, p_expires_at, 0)
+  on conflict (store_id) do update
+    set email = excluded.email,
+        code_hash = excluded.code_hash,
+        expires_at = excluded.expires_at,
+        attempts = 0,
+        created_at = now();
+
+  return query select v_store_id, v_store_name;
+end;
+$$;
+
+revoke all on function request_key_recovery_code(text, text, timestamptz) from public, anon, authenticated;
+grant execute on function request_key_recovery_code(text, text, timestamptz) to service_role;
+
+-- 管理者キー復旧 手順2：確認コードの検証。consume_signup_attemptと全く同じ設計
+-- （原子的な試行枠消費・定数時間でのハッシュ照合・一致時の即時削除）を踏襲する。
+create or replace function consume_key_recovery_attempt(p_email text, p_max int, p_code_hash text)
+returns table (store_id uuid, matched boolean)
+language plpgsql
+as $$
+declare
+  v_store_id uuid;
+  v_hash text;
+  v_diff int := 0;
+  v_i int;
+begin
+  -- request_key_recovery_codeと同じ選び方でメールアドレスから対象店舗を特定する。
+  select id into v_store_id from stores where email = p_email order by created_at desc limit 1;
+  if v_store_id is null then
+    return; -- 該当店舗なし。呼び出し側は共通のエラー文言を返す（列挙防止）。
+  end if;
+
+  -- 枠を原子的に1つ消費する（consume_signup_attemptと同じ、行ロックによる担保）。
+  update key_recovery_requests k
+     set attempts = k.attempts + 1
+   where k.store_id = v_store_id
+     and k.attempts < p_max
+     and k.expires_at > now()
+  returning k.code_hash into v_hash;
+
+  if not found then
+    return query select v_store_id, false;
+    return;
+  end if;
+
+  -- 定数時間比較（consume_signup_attemptと同じ理由・同じ実装）。
+  if v_hash is null or p_code_hash is null or length(v_hash) <> length(p_code_hash) then
+    return query select v_store_id, false;
+    return;
+  end if;
+
+  for v_i in 1..length(v_hash) loop
+    v_diff := v_diff | (ascii(substr(v_hash, v_i, 1)) # ascii(substr(p_code_hash, v_i, 1)));
+  end loop;
+
+  if v_diff <> 0 then
+    return query select v_store_id, false;
+    return;
+  end if;
+
+  -- 一致した場合は同じ関数呼び出しの中で行を削除する（コードは1回限り）。
+  delete from key_recovery_requests k where k.store_id = v_store_id;
+  if not found then
+    return query select v_store_id, false;
+    return;
+  end if;
+
+  return query select v_store_id, true;
+end;
+$$;
+
+revoke all on function consume_key_recovery_attempt(text, int, text) from public, anon, authenticated;
+grant execute on function consume_key_recovery_attempt(text, int, text) to service_role;
+
+-- 低-3是正と同じ理由で、新設テーブル(key_recovery_requests)もanon/authenticatedの
+-- テーブル直アクセスから守る必要があるが、個別に新しいREVOKE文を増やすのではなく、
+-- 本ファイル前半にある「revoke all on table stores, ...」の一覧そのものに
+-- key_recovery_requestsを追記して対応した（低-3の是正コメントが指示する運用どおり。
+-- 一覧を1箇所に保つことで、AC-L5-21のテスト（setup.sqlの全テーブルがrevoke対象一覧に
+-- 含まれているかを検証する）が引き続き機能する）。本番・stagingでこのブロックを
+-- 実行する際は、その「revoke all on table ...」文もあわせて（更新後の内容で）
+-- 再実行すること。
