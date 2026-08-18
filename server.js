@@ -444,6 +444,46 @@ async function sendReportNotificationEmail({ receivedAt, target, content, report
   }
 }
 
+// 代打（欠員募集）が確定したことを、店舗のメールアドレス（stores.email）宛に知らせる通知メール。
+// 【背景】応募が確定すると shifts.status が 'filled' になるだけで、店長には何も通知されず、
+// manager.htmlの「募集状況」を開いて「🔄更新」を押すまで気づけなかった。欠勤の穴埋めは
+// 急ぎの場面であるにもかかわらず、「決まったか気になって何度もアプリを開く」手間が残っており、
+// これはこのアプリの価値（LINEで一人ずつ聞いて回る手間をなくすこと）を損なう穴だった。
+// sendReportNotificationEmailと同じ方式（Resendの/emails APIをSDKなしでfetchする素朴な実装。
+// Node18+のグローバルfetchを利用）で送る。
+// filledBy（応募者名）・note（補足）・storeName（店舗名）はいずれも利用者の自由入力のため、
+// 通報通知メールと同じ理由でescapeHtmlしてから本文に埋め込む（タグを仕込まれても表示が
+// 崩れないようにする）。
+// 件名だけでも「決まったこと」と「いつのシフトか」が分かるようにする。店長はスマホの
+// 通知画面でこれを見ることが多く、本文を開かなくても急ぎの用件だと判断できる必要があるため。
+async function sendShiftFilledNotificationEmail({ storeEmail, storeName, filledBy, date, time, note }) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: storeEmail,
+      subject: `【DAIDA+】代打が決まりました（${date} ${time}）`,
+      html: `
+        <p>「${escapeHtml(storeName)}」の代打募集に応募があり、確定しました。</p>
+        <ul>
+          <li>応募したスタッフ: ${escapeHtml(filledBy)}</li>
+          <li>日付: ${escapeHtml(date)}</li>
+          <li>時間: ${escapeHtml(time)}</li>
+          ${note ? `<li>補足: ${escapeHtml(note)}</li>` : ''}
+        </ul>
+      `,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Resend API error: ${res.status} ${text}`);
+  }
+}
+
 // 店舗名・スタッフ名は「その項目の趣旨（店舗を識別する名称／人を呼ぶための名前）」以外の
 // 個人情報（電話番号・生年月日・性別・メールアドレス等）が入力されていないかを簡易チェックする。
 // 完全な防止策ではなく、明らかに不適切な入力をサーバー側で弾くための最低限のバリデーション。
@@ -726,6 +766,12 @@ function buildApp(overrides = {}) {
   // 「メール送信が失敗しても通報の受付自体は201で成功すること」（AC-R3）を検証できる
   // （省略時＝本番は本物のsendReportNotificationEmailを使う）。
   const sendReportNotificationEmailFn = overrides.sendReportNotificationEmail || sendReportNotificationEmail;
+  // 代打確定の通知メール（Resend APIへの実際のfetch）も同様にテストから差し替え可能にする。
+  // これにより、テストは実際に外部へメールを送信することなく、「メール送信が失敗しても
+  // 応募の確定は成功として扱われること」（AC-N3）や「応答はメール送信を待たないこと」（AC-N5）
+  // を検証できる（省略時＝本番は本物のsendShiftFilledNotificationEmailを使う）。
+  const sendShiftFilledNotificationEmailFn =
+    overrides.sendShiftFilledNotificationEmail || sendShiftFilledNotificationEmail;
 
   // 管理者キー復旧（/api/recovery/*）のレート制限器・メール送信・応答パディングの下限も、
   // 上記と同じ理由でoverridesから差し替え可能にする（省略時＝本番の挙動は一切変わらない）。
@@ -1478,7 +1524,49 @@ function buildApp(overrides = {}) {
       if (error) throw error;
 
       if (data) {
-        return res.json({ message: '応募が完了しました！ありがとうございます！', shift: mapShift(data) });
+        res.json({ message: '応募が完了しました！ありがとうございます！', shift: mapShift(data) });
+
+        // 【AC-N5】通知メールの送信は、応答(res.json)を返した後に行う。応募は先着順で、
+        // スタッフは「応募できたか」を一刻も早く知りたい場面のため、Resendへの往復を
+        // 待たせて応答を遅らせてはいけない。setImmediateで次のイベントループへ回すことで、
+        // 応答の送信が確実に処理された後に通知処理を開始する
+        // （/api/recovery/request-codeの中-4是正と同じ対処）。
+        // 【AC-N7】このブロックはUPDATEが1件成功した(＝自分が先着で確定した)場合にしか
+        // 到達しない。先着で負けた場合はdataがnullになりこのifに入らないため、
+        // 通知は構造的に送られない。
+        setImmediate(async () => {
+          try {
+            // 通知先は店舗登録時に確認済みのメールアドレス(stores.email)。shiftsテーブルには
+            // 店舗名(store_name)しか持たせていないため、宛先を得るためにstoresを引く。
+            const { data: store, error: storeErr } = await supabase
+              .from('stores')
+              .select('email')
+              .eq('id', data.store_id)
+              .maybeSingle();
+            if (storeErr) throw storeErr;
+
+            // 【AC-N6】メール認証機能を追加する前に作られた古い店舗はstores.emailがnullの
+            // ことがある。その場合は送信をスキップする（エラーにはしない）。
+            if (!store || !store.email) return;
+
+            await sendShiftFilledNotificationEmailFn({
+              storeEmail: store.email,
+              storeName: data.store_name,
+              filledBy: data.filled_by,
+              date: data.date,
+              time: data.time,
+              note: data.note,
+            });
+          } catch (e) {
+            // 【AC-N3・最重要】応募の確定(UPDATE)はすでに成功しており、応答も返却済みのため、
+            // ここでの失敗（宛先取得の失敗・メール送信の失敗のどちらも含む）は応募そのものの
+            // 成否には一切影響しない。スタッフには「応募できた」という結果を維持したまま、
+            // 運用者だけがRenderのログで気づけるよう、console.errorに記録する
+            // （/api/reportで同じ判断をした前例と整合させる）。
+            console.error('[ALERT] shift filled notification email failed (response already sent):', e);
+          }
+        });
+        return;
       }
 
       // 更新が0件だった場合：応募している間にすでに他の人が埋めていた
