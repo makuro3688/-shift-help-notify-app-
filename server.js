@@ -484,6 +484,54 @@ async function sendShiftFilledNotificationEmail({ storeEmail, storeName, filledB
   }
 }
 
+// ============================================================================
+// 代打（欠員募集）確定時の3方向プッシュ通知（①応募した本人／②他のスタッフ／③店長）。
+// 【背景】直前の実装（店長へのメール通知のみ）では、応募した本人が「あとで見返せる記録」を
+// 持てず、他のスタッフは通知を受けて開いたら埋まっていた、という体験になっていた。
+// 「決まりました通知がないと現場としてわかりにくい」という運営者からの指摘を受け、
+// 応募確定時にこの3方向へプッシュ通知を送る（/api/shift/:id/respond内で使用）。
+//
+// 【①と②の文面を必ず分ける理由・AC-P3】同じ文面だと、本人が「自分が入るんだっけ？」と迷い、
+// 現場で最も困る事態になる。①は「あなたに決まりました」、②は「他の方に決まりました」と、
+// 主語を明確に書き分ける。
+//
+// 【②を震動なしにする理由・AC-P4】急募（sw.jsの既定vibrate、下のPUSH_VIBRATE_URGENTと同じ値）と
+// この終了通知が同じ強さで震動すると、本当の急募（行動が必要な通知）を見逃すようになる。
+// 終了通知は「お知らせ」であり行動を促すものではないため、震動を伴わない静かな通知にする
+// ことで体感的に区別できるようにする。①・③はいずれも「自分に関係がある確定の知らせ」で
+// あり見逃されると困るため、急募と同じ強さ（PUSH_VIBRATE_URGENT）のままにする。
+const PUSH_VIBRATE_URGENT = [200, 100, 200]; // public/sw.jsの既定値（震動あり）と同じ値。急募・確定など見逃されて困る通知に使う
+const PUSH_VIBRATE_SILENT = []; // 震動なし。②「募集は終了しました」専用（AC-P4）
+
+const PUSH_TITLE_ASSIGNED_TO_ME = '代打が確定しました'; // ①応募した本人向け
+const PUSH_TITLE_CLOSED_FOR_OTHERS = '募集は終了しました'; // ②他のスタッフ向け
+const PUSH_TITLE_MANAGER_FILLED = '代打が決まりました'; // ③店長向け
+
+function buildAssignedToMeBody(date, time) {
+  return `${date} ${time} の代打はあなたに決まりました。よろしくお願いします。`;
+}
+function buildClosedForOthersBody(date, time) {
+  return `${date} ${time} の代打募集は、他の方に決まりました。`;
+}
+// 店長向けは「あなたに」のような一人称の文言を使わない（店長自身が代打に入るわけではないため、
+// ①と読み違えられないようにするための表現の違い）。応募者名も分かるようにする。
+function buildManagerFilledBody(date, time, filledBy) {
+  return `${date} ${time} の代打に${filledBy}さんが決まりました。`;
+}
+
+// Web Push送信の実体（web-pushライブラリ）をラップするだけの薄い関数。
+// sendShiftFilledNotificationEmail等の他の通知関数と同じ理由（テストから実際の送信を
+// 発生させずに差し替え可能にするため）でoverrides経由に差し替え可能にする（buildApp内参照）。
+async function sendPushNotification(subscription, payload) {
+  return webpush.sendNotification(subscription, payload);
+}
+
+// Web Pushの送信失敗が「購読が失効している」ことを示すエラーかどうかを判定する。
+// /api/send-broadcastの既存の判定（410 Gone・404 Not Found）と同じ基準を使う。
+function isStalePushSubscriptionError(err) {
+  return !!err && (err.statusCode === 410 || err.statusCode === 404);
+}
+
 // 店舗名・スタッフ名は「その項目の趣旨（店舗を識別する名称／人を呼ぶための名前）」以外の
 // 個人情報（電話番号・生年月日・性別・メールアドレス等）が入力されていないかを簡易チェックする。
 // 完全な防止策ではなく、明らかに不適切な入力をサーバー側で弾くための最低限のバリデーション。
@@ -772,6 +820,9 @@ function buildApp(overrides = {}) {
   // を検証できる（省略時＝本番は本物のsendShiftFilledNotificationEmailを使う）。
   const sendShiftFilledNotificationEmailFn =
     overrides.sendShiftFilledNotificationEmail || sendShiftFilledNotificationEmail;
+  // 確定通知の拡張（①②③のプッシュ通知）で実際の送信(web-pushライブラリ)を行う関数も、
+  // 同じ理由でテストから差し替え可能にする（省略時＝本番は本物のsendPushNotificationを使う）。
+  const sendPushNotificationFn = overrides.sendPushNotification || sendPushNotification;
 
   // 管理者キー復旧（/api/recovery/*）のレート制限器・メール送信・応答パディングの下限も、
   // 上記と同じ理由でoverridesから差し替え可能にする（省略時＝本番の挙動は一切変わらない）。
@@ -1384,6 +1435,51 @@ function buildApp(overrides = {}) {
     }
   });
 
+  // 店長・時間帯責任者：確定通知（代打が決まりました）を受け取るためのPush Subscriptionを保存。
+  // 【③の実装・AC-P5】店長用ダッシュボード(manager.html)に、スタッフ登録(index.html)と同じ
+  // Web Pushの仕組みで購読する導線を追加した。
+  // 【AC-P6・最重要】ここで保存する購読は、スタッフ向け配信リスト(subscriptionsテーブル)には
+  // 一切書き込まない。別テーブル(manager_subscriptions)に保存することで、店長が
+  // /api/send-broadcast（自分が送った代理募集の通知）まで受け取ってしまう事態を
+  // 構造的に防ぐ（設計判断の詳細はsupabase/setup.sqlのmanager_subscriptionsテーブル定義の
+  // コメントを参照）。
+  // store_idはリクエストボディからではなく、認証済みの管理者キーから決まるreq.storeIdを使う
+  // （/api/send-broadcastと同じ理由。他店舗の店長として購読を登録することはできない）。
+  app.post('/api/manager-subscribe', requireAdmin, async (req, res) => {
+    const { subscription } = req.body || {};
+    if (!subscription || !subscription.endpoint) {
+      return res.status(400).json({ error: '不正なリクエストです' });
+    }
+    try {
+      const { data: existing, error: selErr } = await supabase
+        .from('manager_subscriptions')
+        .select('id')
+        .eq('endpoint', subscription.endpoint)
+        .maybeSingle();
+      if (selErr) throw selErr;
+
+      if (!existing) {
+        const { error: insErr } = await supabase
+          .from('manager_subscriptions')
+          .insert({ endpoint: subscription.endpoint, subscription, store_id: req.storeId });
+        if (insErr) throw insErr;
+      } else {
+        // 既に登録済みの端末が別の管理者キー（＝別店舗）でログインし直した場合は上書きする
+        // （/api/subscribeの既存の考え方と同じ）。
+        const { error: updErr } = await supabase
+          .from('manager_subscriptions')
+          .update({ store_id: req.storeId })
+          .eq('endpoint', subscription.endpoint);
+        if (updErr) throw updErr;
+      }
+
+      res.status(201).json({ message: '確定通知の宛先を保存しました' });
+    } catch (err) {
+      console.error('manager-subscribe error:', err);
+      res.status(500).json({ error: '宛先の保存に失敗しました' });
+    }
+  });
+
   // オーナー・店長／時間帯責任者：ヘルプ募集を自分の店舗のスタッフに配信
   // 店舗はリクエストボディからではなく、ログインに使った管理者キーから決まる。
   // これにより、ある店舗のキーでログインした人が他店舗へ誤配信することはできない。
@@ -1491,6 +1587,13 @@ function buildApp(overrides = {}) {
       if (!name) {
         return res.status(400).json({ error: 'お名前を選択してください' });
       }
+      // 【本人特定・endpoint】respond.htmlは、対応済みの端末であればこの応募がどのPush
+      // Subscriptionから行われたかを一緒に送ってくる。同名のスタッフが複数いる場合でも
+      // 名前だけでは本人の端末を一意に決められないため、endpoint（ブラウザが発行する
+      // 推測不可能な識別子）で本人を特定する。古い端末・キャッシュ等で送られてこない
+      // 場合は空文字のまま扱う（下のsetImmediate内、AC-P7のコメントを参照）。
+      const respondentEndpoint =
+        req.body && typeof req.body.endpoint === 'string' ? req.body.endpoint.trim() : '';
 
       const { data: shift, error: shiftErr } = await supabase
         .from('shifts')
@@ -1526,16 +1629,29 @@ function buildApp(overrides = {}) {
       if (data) {
         res.json({ message: '応募が完了しました！ありがとうございます！', shift: mapShift(data) });
 
-        // 【AC-N5】通知メールの送信は、応答(res.json)を返した後に行う。応募は先着順で、
-        // スタッフは「応募できたか」を一刻も早く知りたい場面のため、Resendへの往復を
-        // 待たせて応答を遅らせてはいけない。setImmediateで次のイベントループへ回すことで、
-        // 応答の送信が確実に処理された後に通知処理を開始する
+        // 【AC-N5・AC-P10】メール・プッシュ通知の送信は、応答(res.json)を返した後に行う。
+        // 応募は先着順で、スタッフは「応募できたか」を一刻も早く知りたい場面のため、
+        // 外部送信の往復を待たせて応答を遅らせてはいけない。setImmediateで次のイベント
+        // ループへ回すことで、応答の送信が確実に処理された後に通知処理を開始する
         // （/api/recovery/request-codeの中-4是正と同じ対処）。
-        // 【AC-N7】このブロックはUPDATEが1件成功した(＝自分が先着で確定した)場合にしか
-        // 到達しない。先着で負けた場合はdataがnullになりこのifに入らないため、
+        // 【AC-N7・AC-P11】このブロックはUPDATEが1件成功した(＝自分が先着で確定した)場合に
+        // しか到達しない。先着で負けた場合はdataがnullになりこのifに入らないため、
         // 通知は構造的に送られない。
-        setImmediate(async () => {
-          try {
+        //
+        // 【なぜ3系統を1つのtry/catchで囲まないか・AC-P9】以前（メール通知のみ）は
+        // 単一のtry/catchで、store.emailが無い場合(AC-N6)に早期returnしていた。今回
+        // プッシュ通知（①②スタッフ・③店長）を追加するにあたり、単一のtry/catchのままだと、
+        // 例えばメール送信で例外が起きた場合や店舗にemailが未設定の場合に、後続の
+        // プッシュ通知まで一切実行されなくなってしまう。メール・①②スタッフ向けプッシュ・
+        // ③店長向けプッシュは互いに独立した通知系統として扱い、1系統の失敗が他の系統を
+        // 止めないようにする（AC-P8が「1人分の送信失敗」について要求しているのと同じ
+        // 考え方を、系統間にも適用する）。応募の確定(UPDATE)はすでに成功しており、
+        // 応答も返却済みのため、いずれの失敗も応募そのものの成否には一切影響しない。
+        setImmediate(() => {
+          const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
+          // --- 店長へのメール通知（既存実装。挙動は変更していない） ---
+          (async () => {
             // 通知先は店舗登録時に確認済みのメールアドレス(stores.email)。shiftsテーブルには
             // 店舗名(store_name)しか持たせていないため、宛先を得るためにstoresを引く。
             const { data: store, error: storeErr } = await supabase
@@ -1557,14 +1673,134 @@ function buildApp(overrides = {}) {
               time: data.time,
               note: data.note,
             });
-          } catch (e) {
+          })().catch((e) => {
             // 【AC-N3・最重要】応募の確定(UPDATE)はすでに成功しており、応答も返却済みのため、
             // ここでの失敗（宛先取得の失敗・メール送信の失敗のどちらも含む）は応募そのものの
             // 成否には一切影響しない。スタッフには「応募できた」という結果を維持したまま、
             // 運用者だけがRenderのログで気づけるよう、console.errorに記録する
             // （/api/reportで同じ判断をした前例と整合させる）。
             console.error('[ALERT] shift filled notification email failed (response already sent):', e);
-          }
+          });
+
+          // --- ①応募した本人／②他のスタッフへのプッシュ通知 ---
+          (async () => {
+            const { data: subs, error: subsErr } = await supabase
+              .from('subscriptions')
+              .select('*')
+              .eq('store_id', data.store_id);
+            if (subsErr) throw subsErr;
+
+            // 【AC-P3の核心】respondentEndpointが、この店舗の購読一覧の中の1件と一致した
+            // 場合にのみ、本人(＝①を受け取るべき端末)を特定できたとみなす。
+            const winnerSub = respondentEndpoint
+              ? (subs || []).find((s) => s.endpoint === respondentEndpoint)
+              : null;
+
+            // 【AC-P7】endpointが送られてこなかった場合（respond.htmlに対応していない古い
+            // 端末のキャッシュ等）や、送られてきたendpointが購読一覧の中に見当たらなかった
+            // 場合は、本人の端末を一意に特定できない。この場合、本人にだけ①を送ろうとして
+            // 特定に失敗し結局誰にも届かない（＝本人の端末を誤って除外した上に、除外した
+            // 端末には②も届かない）よりは、全員に②（募集は終了しました）を送るほうが実害が
+            // 小さいと判断する。本人には「あなたに決まりました」という個別の一言が届かず
+            // 少し不親切だが、応募したこと自体はrespond.html画面の「応募が完了しました」
+            // 表示で分かるため実害は限定的。一方、「誰にも通知が届かない」状態は、他の
+            // スタッフが埋まったことに気づけないまま無駄な問い合わせや二重対応を生みかねず、
+            // 実害が大きい。
+            const canIdentifyRespondent = !!winnerSub;
+
+            const assignedPayload = JSON.stringify({
+              title: PUSH_TITLE_ASSIGNED_TO_ME,
+              body: buildAssignedToMeBody(data.date, data.time),
+              url: `${baseUrl}/respond.html?id=${data.id}`,
+              vibrate: PUSH_VIBRATE_URGENT,
+            });
+            const closedPayload = JSON.stringify({
+              title: PUSH_TITLE_CLOSED_FOR_OTHERS,
+              body: buildClosedForOthersBody(data.date, data.time),
+              url: `${baseUrl}/respond.html?id=${data.id}`,
+              vibrate: PUSH_VIBRATE_SILENT, // 【AC-P4】震動なし。急募・確定の通知と体感で区別する
+            });
+
+            const staleEndpoints = [];
+            // 【AC-P8・最重要】1件の送信失敗（購読の失効・ネットワークエラー等）が、他の
+            // 宛先への送信を止めないよう、map内の各要素で個別にtry/catchする
+            // （/api/send-broadcastの既存の実装と同じ設計。Promise.allの外側で1つだけ
+            // try/catchすると、可読性の面で「なぜ他の人には送られるのか」が分かりにくく
+            // なるため、既存のsend-broadcastと明示的に同じパターンに揃える）。
+            await Promise.all(
+              (subs || []).map(async (s) => {
+                const isWinner = canIdentifyRespondent && s.endpoint === winnerSub.endpoint;
+                const payload = isWinner ? assignedPayload : closedPayload;
+                try {
+                  await sendPushNotificationFn(s.subscription, payload);
+                } catch (err) {
+                  if (isStalePushSubscriptionError(err)) {
+                    staleEndpoints.push(s.endpoint);
+                  }
+                  console.error(
+                    '[ALERT] shift filled push notification (staff) send failed:',
+                    s.endpoint,
+                    err && err.statusCode
+                  );
+                }
+              })
+            );
+
+            if (staleEndpoints.length) {
+              const { error: delErr } = await supabase.from('subscriptions').delete().in('endpoint', staleEndpoints);
+              if (delErr) console.error('shift filled push: stale subscription cleanup failed:', delErr);
+            }
+          })().catch((e) => {
+            console.error('[ALERT] shift filled push notification (staff) failed (response already sent):', e);
+          });
+
+          // --- ③店長へのプッシュ通知 ---
+          (async () => {
+            // 【AC-P6・最重要】ここではmanager_subscriptions（店長専用の別テーブル）のみを
+            // 見る。subscriptions（スタッフ向け配信リスト）には一切触れない。これにより、
+            // 店長が自分の送った代理募集(急募)の通知まで受け取ってしまう事態を構造的に防ぐ
+            // （店長が受け取るのは「確定」だけ、という要件）。
+            const { data: managerSubs, error: managerSubsErr } = await supabase
+              .from('manager_subscriptions')
+              .select('*')
+              .eq('store_id', data.store_id);
+            if (managerSubsErr) throw managerSubsErr;
+
+            const payload = JSON.stringify({
+              title: PUSH_TITLE_MANAGER_FILLED,
+              body: buildManagerFilledBody(data.date, data.time, data.filled_by),
+              url: `${baseUrl}/manager.html`,
+              vibrate: PUSH_VIBRATE_URGENT,
+            });
+
+            const staleEndpoints = [];
+            await Promise.all(
+              (managerSubs || []).map(async (s) => {
+                try {
+                  await sendPushNotificationFn(s.subscription, payload);
+                } catch (err) {
+                  if (isStalePushSubscriptionError(err)) {
+                    staleEndpoints.push(s.endpoint);
+                  }
+                  console.error(
+                    '[ALERT] shift filled push notification (manager) send failed:',
+                    s.endpoint,
+                    err && err.statusCode
+                  );
+                }
+              })
+            );
+
+            if (staleEndpoints.length) {
+              const { error: delErr } = await supabase
+                .from('manager_subscriptions')
+                .delete()
+                .in('endpoint', staleEndpoints);
+              if (delErr) console.error('shift filled push (manager): stale subscription cleanup failed:', delErr);
+            }
+          })().catch((e) => {
+            console.error('[ALERT] shift filled push notification (manager) failed (response already sent):', e);
+          });
         });
         return;
       }

@@ -51,6 +51,30 @@ create table if not exists subscriptions (
   registered_at timestamptz not null default now()
 );
 
+-- 店長・時間帯責任者向けの確定通知（代打が決まりました）専用のPush Subscription。
+-- 【確定通知の拡張・AC-P5〜AC-P6】直前まではメールのみだった店長向けの確定通知に、
+-- プッシュ通知でも受け取れる導線（manager.html）を追加した。
+-- 【なぜsubscriptions（スタッフ向け配信リスト）に混ぜないか・AC-P6の核心】
+-- subscriptionsは/api/send-broadcastが「その店舗のスタッフ全員」に代理募集(急募)を
+-- 配信する際の宛先リストとして使われている。店長の購読をここに混ぜてしまうと、
+-- 店長は自分がまさに送信した急募通知まで自分の端末で受け取ってしまい煩わしいだけでなく、
+-- 「店長の行は除外する」という条件分岐を、スタッフ向け配信のクエリすべてに書き忘れなく
+-- 徹底する運用に頼ることになる。この失敗パターンは、key_recovery_requestsを
+-- pending_signupsから分離した際に採った判断（「役割を区別する列を1つのテーブルに足す案は、
+-- WHERE句の書き忘れで取り違えが再発しうるため採らなかった」）と全く同じであるため、
+-- ここでも同じ理由でテーブルを完全に分離する。これにより、代理募集の配信コードは
+-- 常にsubscriptionsだけを見ればよく、確定通知（店長向けプッシュ）のコードは常に
+-- このmanager_subscriptionsだけを見ればよくなり、取り違えが構造的に起こらなくなる。
+-- store_idは一意にしない（subscriptionsテーブルと同じ考え方。店長が複数端末
+-- （スマホ＋PC等）から購読する場合を想定し、endpointを実質的な一意キーとして扱う）。
+create table if not exists manager_subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references stores(id) on delete cascade,
+  endpoint text unique not null,
+  subscription jsonb not null,
+  registered_at timestamptz not null default now()
+);
+
 -- 急募（シフト応援）の履歴と状態
 create table if not exists shifts (
   id uuid primary key default gen_random_uuid(),
@@ -337,14 +361,15 @@ grant execute on function request_signup_code(text, text, text, timestamptz, int
 -- Data APIから完全に切り離しておく。
 --
 -- この一覧は本ファイルに定義されている全テーブル（stores, supervisor_keys,
--- pending_signups, subscriptions, shifts, app_config, stripe_events, used_emails,
--- reports, key_recovery_requests）を網羅している。新しいテーブルを追加した場合は、
--- ここにも追記すること（key_recovery_requestsは管理者キー復旧機能で追加。テーブル定義自体は
--- 上のreportsテーブルの直後にある。中-2是正で、revoke対象のテーブルは必ずこのrevoke文より
--- 前で定義するようにしている）。
+-- pending_signups, subscriptions, manager_subscriptions, shifts, app_config,
+-- stripe_events, used_emails, reports, key_recovery_requests）を網羅している。
+-- 新しいテーブルを追加した場合は、ここにも追記すること（key_recovery_requestsは
+-- 管理者キー復旧機能で追加。manager_subscriptionsは確定通知の拡張（店長向けプッシュ）で
+-- 追加。テーブル定義自体はいずれも本ファイル前半、対応する既存テーブルの直後にある。
+-- 中-2是正の教訓どおり、revoke対象のテーブルは必ずこのrevoke文より前で定義すること）。
 revoke all on table stores, pending_signups, supervisor_keys, subscriptions,
-                    shifts, app_config, stripe_events, used_emails, reports,
-                    key_recovery_requests
+                    manager_subscriptions, shifts, app_config, stripe_events,
+                    used_emails, reports, key_recovery_requests
   from anon, authenticated;
 -- 将来追加されるテーブルにも、既定でanon/authenticatedへ権限が付与されないようにする
 -- （低-2で指摘された「関数のEXECUTE権限が再作成のたびに手動運用に依存する」のと同種の

@@ -170,6 +170,27 @@ async function submitReport() {
   }
 }
 
+// 【確定通知の拡張・本人特定】この端末が既にDAIDA+のPush Subscriptionを持っていれば、
+// そのendpoint（ブラウザが発行する推測不可能な識別子）を取得する。同名のスタッフが
+// 複数登録されている場合でも、名前だけでは「どの端末から応募したか」を区別できないため、
+// サーバー側はこのendpointを使って本人の端末を一意に特定し、①（あなたに決まりました）と
+// ②（他の方に決まりました）を出し分ける。
+// iPhoneのSafariタブで開いた場合や、通知登録前にこの画面を開いた場合など、購読が
+// 存在しない・取得できない端末もある。その場合はnullを返し、サーバー側に判断を委ねる
+// （endpointが送られてこない場合の扱いはserver.js側のAC-P7コメントを参照。
+// ここでは「取得できない」ことを例外にせず、素直にnullとして扱うだけにとどめる）。
+async function getCurrentPushEndpoint() {
+  try {
+    if (!('serviceWorker' in navigator)) return null;
+    const registration = await navigator.serviceWorker.getRegistration('/sw.js');
+    if (!registration) return null;
+    const subscription = await registration.pushManager.getSubscription();
+    return subscription ? subscription.endpoint : null;
+  } catch (err) {
+    return null;
+  }
+}
+
 async function respond() {
   const btn = document.getElementById('respondBtn');
   const resultEl = document.getElementById('result');
@@ -183,10 +204,11 @@ async function respond() {
   resultEl.textContent = '送信中...';
 
   try {
+    const endpoint = await getCurrentPushEndpoint();
     const res = await fetch(`/api/shift/${shiftId}/respond`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(endpoint ? { name, endpoint } : { name }),
     });
     const data = await res.json();
     if (res.status === 409) {

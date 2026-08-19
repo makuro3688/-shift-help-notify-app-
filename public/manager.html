@@ -160,6 +160,18 @@
   <div id="status" class="status"></div>
 </div>
 
+<!-- 確定通知の拡張（③店長へのプッシュ通知・AC-P5〜AC-P6）。
+     スタッフ登録(index.html)と同じWeb Pushの仕組みで、この端末に「代打が決まりました」の
+     通知だけを受け取れるようにする。急募（自分が送った代理募集）の通知はここでは
+     一切購読しない（スタッフ向け配信リスト(subscriptionsテーブル)とは別の
+     manager_subscriptionsテーブルに保存するため、届く心配がない。AC-P6）。 -->
+<div class="card" id="managerPushCard">
+  <h2>🔔 確定通知（プッシュ）</h2>
+  <p style="font-size:13px;color:#555;margin-top:-8px;">この端末で「代打が決まりました」の通知を受け取れます。自分が送った急募の通知はここでは届きません（急募はスタッフ向けの通知です）。</p>
+  <button id="managerPushBtn" onclick="enableManagerPushNotification()">🔔 この端末で確定通知を受け取る</button>
+  <div id="managerPushStatus" class="status"></div>
+</div>
+
 <div class="card" id="planCard">
   <h2>💳 ご利用プラン</h2>
   <div id="planStatus" class="planStatus">読み込み中...</div>
@@ -972,6 +984,71 @@ function handleCheckoutRedirect() {
   if (checkout) {
     history.replaceState({}, '', location.pathname);
   }
+}
+
+// 確定通知の拡張（③店長へのプッシュ通知）。index.html の enablePushNotification() と
+// 同じWeb Pushの仕組みを使うが、保存先エンドポイントだけが異なる（/api/manager-subscribe。
+// スタッフ向けの/api/subscribeとは別のテーブル(manager_subscriptions)に保存されるため、
+// 急募の配信対象には混ざらない。AC-P6）。認証はログイン中の管理者キー(x-admin-key)で行う
+// ため、store_idを画面から送る必要はない（サーバー側が管理者キーから店舗を特定する）。
+async function enableManagerPushNotification() {
+  const btn = document.getElementById('managerPushBtn');
+  const statusEl = document.getElementById('managerPushStatus');
+
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    statusEl.textContent = 'お使いのブラウザはプッシュ通知に対応していません。';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '登録中...';
+  try {
+    const register = await navigator.serviceWorker.register('/sw.js');
+
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      statusEl.textContent = '通知が拒否されました。ブラウザの設定から許可してください。';
+      btn.disabled = false;
+      return;
+    }
+
+    const { publicKey } = await fetch('/api/vapid-public-key').then((r) => r.json());
+
+    const subscription = await register.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+
+    const res = await fetch('/api/manager-subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ subscription }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(data.error || '登録に失敗しました');
+    }
+
+    statusEl.textContent = '✅ ' + data.message;
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = '登録中にエラーが発生しました：' + err.message;
+    btn.disabled = false;
+  }
+}
+
+// index.htmlのurlBase64ToUint8Array()と同じ変換処理（VAPID公開鍵の形式変換）。
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
 }
 
 function escapeHtml(str) {
