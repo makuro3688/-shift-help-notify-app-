@@ -123,7 +123,34 @@ test('正常系(AC-M1): オーナーの管理者キーでログインすると�
   }
 });
 
-test('正常系(AC-M1): 時間帯責任者のキーでも、その店舗のemailが返る（画面側で表示を制限する）', async () => {
+test('正常系(AC-S8): 時間帯責任者には、自分が登録したアドレスが返る', async () => {
+  const supabase = createFakeSupabase({
+    stores: [makeStore()],
+    supervisorKeys: [
+      {
+        id: 'sk-1',
+        store_id: 'store-1',
+        admin_key_hash: hashKey(SUPERVISOR_KEY),
+        email: 'supervisor@example.com',
+      },
+    ],
+  });
+  const app = buildApp({ supabase });
+  const server = app.listen(0);
+  try {
+    const res = await getJson(server, '/api/me', { 'x-admin-key': SUPERVISOR_KEY });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.role, 'supervisor');
+    assert.strictEqual(res.body.email, 'supervisor@example.com');
+    assert.strictEqual(res.body.canEditEmail, true, '時間帯責任者は自分の宛先を変更できる');
+  } finally {
+    server.close();
+  }
+});
+
+test('異常系(AC-S8・核心): 時間帯責任者には、オーナーのアドレス(stores.email)を返さない', async () => {
+  // 未登録の時間帯責任者。ここでオーナーのアドレスが漏れると、キーを預かっただけの人に
+  // オーナー個人の連絡先を開示することになる。
   const supabase = createFakeSupabase({
     stores: [makeStore()],
     supervisorKeys: [{ id: 'sk-1', store_id: 'store-1', admin_key_hash: hashKey(SUPERVISOR_KEY) }],
@@ -133,8 +160,23 @@ test('正常系(AC-M1): 時間帯責任者のキーでも、その店舗のemail
   try {
     const res = await getJson(server, '/api/me', { 'x-admin-key': SUPERVISOR_KEY });
     assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.body.role, 'supervisor');
-    assert.strictEqual(res.body.email, 'owner@example.com');
+    assert.strictEqual(res.body.email, null, '未登録ならnull。オーナーのアドレスで代用してはいけない');
+    assert.ok(
+      !JSON.stringify(res.body).includes('owner@example.com'),
+      'オーナーのアドレスが応答のどこにも含まれてはいけない'
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('正常系(AC-S8): オーナーは canEditEmail が false（この画面からは変更できない）', async () => {
+  const supabase = createFakeSupabase({ stores: [makeStore()] });
+  const app = buildApp({ supabase });
+  const server = app.listen(0);
+  try {
+    const res = await getJson(server, '/api/me', { 'x-admin-key': OWNER_KEY });
+    assert.strictEqual(res.body.canEditEmail, false);
   } finally {
     server.close();
   }

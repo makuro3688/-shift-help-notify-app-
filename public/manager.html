@@ -62,6 +62,10 @@
   .filledMailAddress { font-family: monospace; font-size: 14px; font-weight: bold; color: #1a4a6b; background: #eef5fa; border: 1px solid #bcd7e8; border-radius: 8px; padding: 12px 14px; margin: 10px 0; line-height: 1.7; word-break: break-all; }
   .filledMailAddressMissing { font-family: inherit; font-weight: normal; color: #8a2e2e; background: #fdecec; border-color: #f5c6c6; word-break: normal; }
   .filledMailAddressPlain { font-family: inherit; font-weight: normal; word-break: normal; }
+  /* 時間帯責任者の一覧に出す、通知先の登録状況。オーナーが「誰にまだ声をかけていないか」
+     を一目で分かるようにするためのもの（アドレス自体は表示しない）。 */
+  .supervisorMailOk { display: inline-block; font-size: 11px; color: #1a6b3a; background: #e8f5ec; border-radius: 4px; padding: 2px 6px; margin-left: 6px; }
+  .supervisorMailNone { display: inline-block; font-size: 11px; color: #8a5a00; background: #fff6e6; border-radius: 4px; padding: 2px 6px; margin-left: 6px; }
   .filledMailAddress a { color: #00639b; font-weight: bold; }
   .consentNote { font-size: 12px; color: #888; margin-top: 10px; line-height: 1.6; }
   .consentNote a { color: #00639b; }
@@ -173,9 +177,33 @@
      合っているかを店長自身が確認できるようにするため。 -->
 <div class="card" id="filledMailCard">
   <h2>📧 代理出勤の確定通知</h2>
-  <p style="font-size:13px;color:#555;margin-top:-8px;">代打が決まると、その場で下のメールアドレス宛にお知らせが届きます。アプリを開いて確認する必要はありません。</p>
+  <p style="font-size:13px;color:#555;margin-top:-8px;" id="filledMailLead">代打が決まると、その場で下のメールアドレス宛にお知らせが届きます。アプリを開いて確認する必要はありません。</p>
   <div id="filledMailAddress" class="filledMailAddress">読み込み中...</div>
-  <p style="font-size:12px;color:#777;margin-bottom:0;">※ 宛先を変更したい場合は <a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。<br>※ 届かない場合は迷惑メールフォルダもご確認ください。</p>
+
+  <!-- 時間帯責任者だけに出る、自分の通知先を登録・変更する導線。
+       オーナーには出さない（stores.emailは管理者キー復旧とStripeの宛先を
+       兼ねており、画面から変更できるとアカウント乗っ取りの経路になるため。
+       詳細はserver.jsのrequireSupervisorのコメント）。 -->
+  <div id="supervisorEmailArea" style="display:none;">
+    <div id="supervisorEmailStep1">
+      <label for="supervisorEmailInput" id="supervisorEmailInputLabel">通知を受け取るメールアドレス</label>
+      <input id="supervisorEmailInput" type="email" inputmode="email" autocomplete="email" placeholder="例：taro@example.com" maxlength="254">
+      <button id="supervisorEmailRequestBtn" onclick="requestSupervisorEmailCode()">確認コードを送る</button>
+      <p class="minorNightNote">打ち間違いを防ぐため、入力したアドレス宛に6桁の確認コードをお送りします。コードを入力して初めて登録されます。</p>
+    </div>
+
+    <div id="supervisorEmailStep2" style="display:none;">
+      <label for="supervisorEmailCodeInput">確認コード（6桁）</label>
+      <input id="supervisorEmailCodeInput" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code">
+      <button id="supervisorEmailVerifyBtn" onclick="verifySupervisorEmailCode()">確認して登録する</button>
+      <button type="button" class="linkBtn" onclick="backToSupervisorEmailInput()">メールアドレスを入力し直す</button>
+    </div>
+
+    <button type="button" class="linkBtn" id="supervisorEmailClearBtn" style="display:none;" onclick="clearSupervisorEmail()">🔕 通知を受け取らない（登録を解除する）</button>
+    <div id="supervisorEmailStatus" class="status"></div>
+  </div>
+
+  <p style="font-size:12px;color:#777;margin-bottom:0;" id="filledMailFootnote">※ 宛先を変更したい場合は <a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。<br>※ 届かない場合は迷惑メールフォルダもご確認ください。</p>
 </div>
 
 <div class="card" id="planCard">
@@ -756,16 +784,26 @@ async function loadSupervisors() {
       listEl.textContent = 'まだ発行済みのキーはありません。';
       return;
     }
+    // 【AC-S12】確定通知の宛先が未登録の人には印を付ける。
+    // 登録は本人にしかできない（オーナーが代わりに入れることはできない）ため、
+    // オーナーができるのは「まだの人に声をかける」ことだけ。
+    // なお、登録済みのアドレスそのものはサーバーが返していない（本人の連絡先を
+    // オーナーが一覧できる必要はないため）。
     listEl.innerHTML = list
       .map(
         (s) => `
       <div class="staffRow">
         👤 ${escapeHtml(s.label || '（ラベルなし）')}
+        ${s.hasEmail ? '<span class="supervisorMailOk">📧 通知先 登録済み</span>' : '<span class="supervisorMailNone">📧 通知先 未登録</span>'}
         <span class="logout" style="float:right;" onclick="revokeSupervisor('${s.id}')">失効</span>
       </div>
     `
       )
       .join('');
+    if (list.some((s) => !s.hasEmail)) {
+      listEl.innerHTML +=
+        '<p class="noteBox">「通知先 未登録」の方には、代打が決まってもメールが届きません。ご本人がこの画面（時間帯責任者キーでログイン）から登録できます。ご案内をお願いします。</p>';
+    }
   } catch (err) {
     listEl.textContent = '❌ ' + err.message;
   }
@@ -993,30 +1031,171 @@ function handleCheckoutRedirect() {
   }
 }
 
-// 代理出勤の確定通知の宛先を表示する（AC-M1〜AC-M3）。
-// 【AC-M2】emailはnullでありうる（古い登録・取得失敗）。その場合は空欄にせず、
-// 「未設定です」と明示して連絡先を案内する。空欄のままだと「通知は来るはず」と
-// 誤解したまま気づけないため。
-// 【AC-M3】メールアドレスは必ずescapeHtml()を通す。stores.emailは登録者が入力した
-// 値であり、そのままinnerHTMLに入れるとHTMLとして解釈されうるため。
-// 【AC-M4】時間帯責任者には実際のアドレスを見せない。stores.emailはオーナー個人の
-// 連絡先であり、キーを預かっただけの時間帯責任者に開示する理由がない
-// （管理者キーは共有しない、という運用方針と同じ考え方）。
-// 「どこに届くか」ではなく「メールで届く」ことだけ伝われば現場は困らない。
+// 代理出勤の確定通知の宛先を表示する。
+// 【AC-M2】emailはnullでありうる（未登録・古い登録）。その場合は空欄にせず、
+// 「未設定です」と明示する。空欄のままだと「通知は来るはず」と誤解したまま気づけない。
+// 【AC-M3】メールアドレスはtextContentで入れる。利用者が入力した値であり、
+// innerHTMLに入れるとHTMLとして解釈されうるため。
+// 【AC-S8】オーナーと時間帯責任者で、表示する内容も操作できることも違う。
+//   オーナー       … stores.email を表示。ここからは変更できない（support@へ）
+//   時間帯責任者   … 自分が登録したアドレスを表示。自分で登録・変更・解除できる
 function renderFilledMailAddress(email) {
   const el = document.getElementById('filledMailAddress');
   if (!el) return;
-  if (currentRole !== 'owner') {
-    el.textContent = '📧 オーナー・店長のご登録メールアドレス宛にお送りします。';
-    el.className = 'filledMailAddress filledMailAddressPlain';
-    return;
+
+  const isSupervisor = currentRole === 'supervisor';
+  const area = document.getElementById('supervisorEmailArea');
+  const footnote = document.getElementById('filledMailFootnote');
+  const lead = document.getElementById('filledMailLead');
+  const clearBtn = document.getElementById('supervisorEmailClearBtn');
+
+  // オーナー向けの注記（support@へ連絡）は、自分で変更できる時間帯責任者には出さない。
+  if (area) area.style.display = isSupervisor ? 'block' : 'none';
+  if (footnote) {
+    footnote.innerHTML = isSupervisor
+      ? '※ 届かない場合は迷惑メールフォルダもご確認ください。<br>※ ここに登録したアドレスは、ご自身が送った代理募集の確定通知にのみ使われます。'
+      : '※ 宛先を変更したい場合は <a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。<br>※ 届かない場合は迷惑メールフォルダもご確認ください。';
   }
+  if (lead) {
+    lead.textContent = isSupervisor
+      ? 'ご自身が送った代理募集に代打が決まると、その場でメールでお知らせします。アプリを開いて確認する必要はありません。'
+      : '代打が決まると、その場で下のメールアドレス宛にお知らせが届きます。アプリを開いて確認する必要はありません。';
+  }
+
   if (email) {
     el.className = 'filledMailAddress';
     el.textContent = '📧 ' + email; // textContentなのでHTMLとして解釈されない（AC-M3）
+    if (clearBtn) clearBtn.style.display = isSupervisor ? 'block' : 'none';
   } else {
     el.className = 'filledMailAddress filledMailAddressMissing';
-    el.innerHTML = '⚠️ メールアドレスが未設定のため、確定通知をお送りできません。<a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。';
+    if (isSupervisor) {
+      el.textContent = '⚠️ 通知先が未登録です。下から登録すると、確定通知が届くようになります。';
+    } else {
+      el.innerHTML = '⚠️ メールアドレスが未設定のため、確定通知をお送りできません。<a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。';
+    }
+    if (clearBtn) clearBtn.style.display = 'none';
+  }
+
+  // 登録済みなら入力欄には現在のアドレスを初期表示しておく（変更しやすくするため）。
+  const input = document.getElementById('supervisorEmailInput');
+  const inputLabel = document.getElementById('supervisorEmailInputLabel');
+  if (isSupervisor && input) {
+    input.value = email || '';
+    if (inputLabel) {
+      inputLabel.textContent = email ? '通知先を変更する（新しいメールアドレス）' : '通知を受け取るメールアドレス';
+    }
+  }
+  backToSupervisorEmailInput();
+}
+
+// --- 時間帯責任者：自分の通知先メールアドレスの登録 ---
+// 【なぜ確認コードを挟むのか】確定通知メールには応募したスタッフの氏名・店舗名・
+// 勤務日時が含まれる。打ち間違えたまま登録すると、無関係の人にスタッフの個人情報が
+// 届き続け、スタッフ本人はそれに気づくことも止めることもできない。
+// 困るのが「ミスをした本人」ではなく「何も知らないスタッフ」なので、仕組みで防ぐ。
+
+function backToSupervisorEmailInput() {
+  const step1 = document.getElementById('supervisorEmailStep1');
+  const step2 = document.getElementById('supervisorEmailStep2');
+  if (step1) step1.style.display = 'block';
+  if (step2) step2.style.display = 'none';
+  const codeInput = document.getElementById('supervisorEmailCodeInput');
+  if (codeInput) codeInput.value = '';
+}
+
+async function requestSupervisorEmailCode() {
+  const btn = document.getElementById('supervisorEmailRequestBtn');
+  const statusEl = document.getElementById('supervisorEmailStatus');
+  const email = document.getElementById('supervisorEmailInput').value.trim();
+
+  if (!email) {
+    statusEl.textContent = 'メールアドレスを入力してください。';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '送信中...';
+  try {
+    const res = await fetch('/api/me/email/request-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(data.error || '送信に失敗しました');
+    }
+    statusEl.textContent = '✅ ' + data.message;
+    document.getElementById('supervisorEmailStep1').style.display = 'none';
+    document.getElementById('supervisorEmailStep2').style.display = 'block';
+    document.getElementById('supervisorEmailCodeInput').focus();
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function verifySupervisorEmailCode() {
+  const btn = document.getElementById('supervisorEmailVerifyBtn');
+  const statusEl = document.getElementById('supervisorEmailStatus');
+  const code = document.getElementById('supervisorEmailCodeInput').value.trim();
+
+  if (!code) {
+    statusEl.textContent = '確認コードを入力してください。';
+    return;
+  }
+
+  btn.disabled = true;
+  statusEl.textContent = '確認中...';
+  try {
+    const res = await fetch('/api/me/email/verify-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ code }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(data.error || '確認に失敗しました');
+    }
+    // 表示を登録済みの状態に切り替える（サーバーが返した値を正とする）。
+    renderFilledMailAddress(data.email);
+    statusEl.textContent = '✅ ' + data.message;
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function clearSupervisorEmail() {
+  if (!confirm('確定通知の宛先を解除します。代打が決まっても、あなたにはメールが届かなくなります。よろしいですか？')) {
+    return;
+  }
+  const statusEl = document.getElementById('supervisorEmailStatus');
+  statusEl.textContent = '解除中...';
+  try {
+    const res = await fetch('/api/me/email', { method: 'DELETE', headers: authHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      throw new Error(data.error || '解除に失敗しました');
+    }
+    renderFilledMailAddress(null);
+    statusEl.textContent = '✅ ' + data.message;
+  } catch (err) {
+    statusEl.textContent = '❌ ' + err.message;
   }
 }
 

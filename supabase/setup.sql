@@ -579,3 +579,137 @@ grant execute on function consume_key_recovery_attempt(text, int, text) to servi
 -- 含まれているかを検証する）が引き続き機能する）。本番・stagingでこのブロックを
 -- 実行する際は、その「revoke all on table ...」文もあわせて（更新後の内容で）
 -- 再実行すること。
+
+-- ============================================================================
+-- 時間帯責任者への確定通知（2026-08-21 追加）
+-- ============================================================================
+-- 【背景】代打が確定したときの通知先は stores.email（オーナー）1つだけだった。
+-- しかし実際に代理募集を送るのは時間帯責任者であることが多く、その人に結果が
+-- 届かないと「自分が送った募集の結果を自分で確認できない」状態になっていた。
+--
+-- 【設計】確定通知の宛先を「オーナー ＋ その募集を送った時間帯責任者」にする。
+-- そのために必要なものが2つある。
+--   ① 時間帯責任者のメールアドレス（今までどこにも保存していなかった）
+--   ② 「その募集を誰が送ったか」の記録（shiftsに送信者を識別する列が無かった）
+--
+-- 【なぜ確認コードで検証するか】確定通知メールには、応募したスタッフの氏名・
+-- 店舗名・勤務日時が含まれる。これは第三者（スタッフ本人）の個人情報である。
+-- 時間帯責任者がアドレスを打ち間違えたまま登録すると、無関係の人にスタッフの
+-- 個人情報が届き続け、しかもスタッフ本人はそれに気づくことも止めることもできない。
+-- 「ミスをした本人ではなく、何も知らない第三者が不利益を受ける」構造のため、
+-- 本人の善意や注意力に委ねず、仕組みの側で防ぐ。
+-- 検証の作法は店舗登録(consume_signup_attempt)・管理者キー復旧
+-- (consume_key_recovery_attempt)で監査済みの設計をそのまま踏襲する。
+
+-- ① 時間帯責任者のメールアドレスと、その確認コードの保留状態。
+-- 【なぜ専用テーブルを作らず supervisor_keys に列を足したか】
+-- pending_signups / key_recovery_requests を分離したときの理由は
+-- 「同じメールアドレスで別用途の保留行がぶつかり、取り違えが起きうるから」だった。
+-- 今回は保留行の持ち主が supervisor_keys.id で一意に決まり、他の用途と
+-- キーを共有しない。「1人の時間帯責任者につき、保留中のアドレス変更は最大1件」は
+-- 制約ではなくむしろ望ましい仕様（同時に2つのアドレスを保留にする意味がない）。
+-- したがって取り違えの余地が構造的に無く、テーブルを増やす理由がない。
+alter table supervisor_keys add column if not exists email text;
+alter table supervisor_keys add column if not exists pending_email text;
+alter table supervisor_keys add column if not exists pending_email_code_hash text;
+alter table supervisor_keys add column if not exists pending_email_expires_at timestamptz;
+alter table supervisor_keys add column if not exists pending_email_attempts int not null default 0;
+
+-- ② その代理募集を送った時間帯責任者。nullは「オーナー・店長が送った」ことを意味する。
+-- 【on delete set null にする理由】cascade にすると、時間帯責任者キーを失効させた
+-- ときに過去の募集履歴そのものが消える。履歴は残すべきなので set null にする。
+-- 失効後は「オーナーが送った」と同じ扱いになるが、その募集は既に確定済みで
+-- 通知の対象ではないため実害はない。
+alter table shifts add column if not exists created_by_supervisor_id uuid
+  references supervisor_keys(id) on delete set null;
+
+-- 確定通知の宛先を引くときに使う（store_idで既に絞られた後の1行参照なので
+-- 索引は必須ではないが、失効時のset null検索でも使われるため付けておく）。
+create index if not exists shifts_created_by_supervisor_id_idx
+  on shifts (created_by_supervisor_id);
+
+-- 時間帯責任者のメールアドレス確認コードを検証し、一致した場合にのみ
+-- 保留中のアドレス(pending_email)を確定アドレス(email)に昇格させる。
+--
+-- 【なぜRPCが必要か】「email に pending_email の値を入れる」という列から列への
+-- 代入は PostgREST の .update() では表現できない。JS側で「読む→比べる→書く」に
+-- 分けると、その隙間に別のリクエストが割り込める（中-A の失敗と同じ形）。
+--
+-- 【L-013】RETURNS TABLE の列名は out_ 接頭辞にする。supervisor_keys には
+-- email 列があるため、OUTパラメータを email という名前にすると、PL/pgSQL の
+-- 変数として解決される文脈で 42702（ambiguous）を実行時に踏む危険がある。
+-- 過去2回この種類のエラーでリリースが止まっている。
+create or replace function consume_supervisor_email_code(p_supervisor_id uuid, p_max int, p_code_hash text)
+returns table (out_email text, out_matched boolean)
+language plpgsql
+as $$
+declare
+  v_hash text;
+  v_pending text;
+  v_saved text;
+  v_diff int := 0;
+  v_i int;
+begin
+  -- 試行枠を原子的に1つ消費する（consume_signup_attempt と同じ、行ロックによる担保）。
+  -- 照合より先に消費するのが要点。先に照合すると、間違ったコードを試し放題になる。
+  -- なお、この UPDATE が取る行ロックは関数（＝トランザクション）の終わりまで保持される
+  -- ため、同時に届いた2つ目の呼び出しはここで待たされ、1つ目が pending_email を
+  -- 消した後に条件不一致で弾かれる。コードが1回しか使えないことはこれで担保される。
+  update supervisor_keys s
+     set pending_email_attempts = s.pending_email_attempts + 1
+   where s.id = p_supervisor_id
+     and s.pending_email is not null
+     and s.pending_email_attempts < p_max
+     and s.pending_email_expires_at > now()
+  returning s.pending_email_code_hash, s.pending_email into v_hash, v_pending;
+
+  if not found then
+    return query select null::text, false;
+    return;
+  end if;
+
+  -- 定数時間比較（consume_signup_attempt と同じ理由・同じ実装）。
+  -- 早期リターンする比較だと、一致した文字数が応答時間に漏れる。
+  if v_hash is null or p_code_hash is null or length(v_hash) <> length(p_code_hash) then
+    return query select null::text, false;
+    return;
+  end if;
+
+  for v_i in 1..length(v_hash) loop
+    v_diff := v_diff | (ascii(substr(v_hash, v_i, 1)) # ascii(substr(p_code_hash, v_i, 1)));
+  end loop;
+
+  if v_diff <> 0 then
+    return query select null::text, false;
+    return;
+  end if;
+
+  -- 一致した場合のみ、同じ関数呼び出しの中で昇格させ、保留状態を消す。
+  -- where に pending_email_code_hash = v_hash を残しているのは多層防御
+  -- （行ロックが担保しているが、それだけに依存しない）。
+  update supervisor_keys s
+     set email = v_pending,
+         pending_email = null,
+         pending_email_code_hash = null,
+         pending_email_expires_at = null,
+         pending_email_attempts = 0
+   where s.id = p_supervisor_id
+     and s.pending_email_code_hash = v_hash
+  returning s.email into v_saved;
+
+  if not found then
+    return query select null::text, false;
+    return;
+  end if;
+
+  return query select v_saved, true;
+end;
+$$;
+
+-- 低-5の教訓：新しい関数には anon の実行権限が既定で付く。明示的に剥がす。
+revoke all on function consume_supervisor_email_code(uuid, int, text) from public, anon, authenticated;
+grant execute on function consume_supervisor_email_code(uuid, int, text) to service_role;
+
+-- 【revoke対象テーブル一覧について】今回は新しいテーブルを作っていない
+-- （既存の supervisor_keys / shifts に列を足しただけ）ため、本ファイル前半の
+-- 「revoke all on table stores, ...」の一覧に追記する必要はない。

@@ -27,6 +27,17 @@ const {
   KEY_RECOVERY_VERIFY_FAILED_MESSAGE,
   respondWithPadding,
 } = require('./lib/keyRecovery');
+// 時間帯責任者の通知先メールアドレス登録（/api/me/email/*）。
+// 専用テーブルを作らずsupervisor_keysに列を足した理由はlib/supervisorEmail.js冒頭のコメント参照。
+const {
+  requestSupervisorEmailCode,
+  verifySupervisorEmailCode,
+  clearSupervisorEmail,
+  findEmailIssue,
+  SUPERVISOR_EMAIL_CODE_MAX_ATTEMPTS,
+  SUPERVISOR_EMAIL_CODE_TTL_MINUTES,
+  SUPERVISOR_EMAIL_VERIFY_FAILED_MESSAGE,
+} = require('./lib/supervisorEmail');
 
 const PORT = process.env.PORT || 3000;
 
@@ -246,6 +257,45 @@ const KEY_RECOVERY_REQUEST_MIN_RESPONSE_TIME_MS = 400;
 // パディングを適用する。値は小さめでよい。
 const KEY_RECOVERY_VERIFY_MIN_RESPONSE_TIME_MS = 100;
 
+// 【時間帯責任者の通知先登録】/api/me/email/request-code のレート制限。
+// 【なぜ必要か・最も重要な観点】このAPIは「任意のメールアドレスに、当サービスから
+// メールを送らせる」ことができる。認証済み（時間帯責任者キーが必要）とはいえ、
+// キーを1つ持っているだけで、当サービスを迷惑メールの中継役として使えてしまう。
+// 送信元ドメイン(send.daida-store.jp)の評価が落ちると、確認コードも確定通知も
+// 迷惑メール扱いされ始め、サービス全体が機能しなくなる。
+//
+// 【なぜIPではなく時間帯責任者ID単位か】このAPIは認証済みなので、IPを変えても
+// 同じキーである限り回避できないIDを鍵にするほうが厳しく効く。
+// 正規の利用者は「登録する／打ち間違えて出し直す」程度なので、1時間5回で十分足りる。
+const SUPERVISOR_EMAIL_REQUEST_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const SUPERVISOR_EMAIL_REQUEST_RATE_LIMIT_MAX_REQUESTS = 5; // 1人あたり1時間に5回まで
+const isSupervisorEmailRequestAllowed = createRateLimiter(
+  SUPERVISOR_EMAIL_REQUEST_RATE_LIMIT_WINDOW_MS,
+  SUPERVISOR_EMAIL_REQUEST_RATE_LIMIT_MAX_REQUESTS
+);
+
+// サービス全体の上限。キーを大量に発行できる立場（＝オーナー）が、多数の
+// 時間帯責任者キーを作って1人あたりの上限を回避する経路を塞ぐ多層防御。
+// 店舗登録・キー復旧のグローバル上限と同じ考え方だが、
+// 【中-5の教訓】グローバル上限が枯れると全店舗が巻き添えで止まるため、
+// 「正規利用でこの値に届くことはまず無い」水準に設定する。
+const SUPERVISOR_EMAIL_REQUEST_GLOBAL_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1時間
+const SUPERVISOR_EMAIL_REQUEST_GLOBAL_RATE_LIMIT_MAX_REQUESTS = 200; // サービス全体で1時間200通まで
+const isSupervisorEmailRequestAllowedGlobally = createRateLimiter(
+  SUPERVISOR_EMAIL_REQUEST_GLOBAL_RATE_LIMIT_WINDOW_MS,
+  SUPERVISOR_EMAIL_REQUEST_GLOBAL_RATE_LIMIT_MAX_REQUESTS
+);
+const SUPERVISOR_EMAIL_REQUEST_GLOBAL_RATE_LIMIT_KEY = 'global';
+
+// 検証側の上限。RPC内の試行回数（5回）が本質的な防御だが、
+// 「コードを要求し直して5回ずつ試す」の繰り返しを抑えるために重ねる。
+const SUPERVISOR_EMAIL_VERIFY_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10分間
+const SUPERVISOR_EMAIL_VERIFY_RATE_LIMIT_MAX_REQUESTS = 20; // 1人あたり10分間に20回まで
+const isSupervisorEmailVerifyAllowed = createRateLimiter(
+  SUPERVISOR_EMAIL_VERIFY_RATE_LIMIT_WINDOW_MS,
+  SUPERVISOR_EMAIL_VERIFY_RATE_LIMIT_MAX_REQUESTS
+);
+
 // 通報の証跡として記録するIPアドレス・User-Agentの最大文字数。
 // ヘッダ由来の値をそのままDBに保存すると、異常に長い値でストレージを圧迫し得るため上限を設ける。
 const REPORT_SOURCE_IP_MAX_LENGTH = 64;
@@ -407,6 +457,36 @@ function escapeHtml(value) {
 // 【背景】通報はDBに保存されるだけでは運営が気づけず、実際に本番でテスト通報を送っても
 // 誰も気づけない状態だった。第13条2項の「合理的な調査」を行うには、まず通報の発生に
 // 運営が気づける必要があるため、このメールで気づける状態にする。
+// 時間帯責任者が自分の通知先メールアドレスを登録するときの確認コードメール。
+// sendSignupCodeEmailと同じ方式。
+// 【重要】storeNameもcodeも本文に入れるが、storeNameは登録者が入力した文字列なので
+// 必ずescapeHtml()を通す（codeは数字6桁を生成しているのでその心配はない）。
+async function sendSupervisorEmailCodeEmail(email, code, storeName) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: RESEND_FROM_EMAIL,
+      to: email,
+      subject: 'DAIDA+ 代理出勤の確定通知 確認コード',
+      html: `
+        <p>「${escapeHtml(storeName)}」の時間帯責任者として、代理出勤の確定通知の宛先にこのメールアドレスを登録するご依頼を受け付けました。</p>
+        <p>以下の確認コードを画面に入力してください（${SUPERVISOR_EMAIL_CODE_TTL_MINUTES}分間有効です）。</p>
+        <p style="font-size:28px; font-weight:bold; letter-spacing:4px;">${code}</p>
+        <p>登録が完了すると、ご自身が送った代理募集に代打が決まったときに、このアドレス宛にお知らせが届くようになります。</p>
+        <p><strong>この操作に心当たりがない場合は、このメールを破棄してください。</strong>何もしなければ登録されず、このアドレスに通知が届くこともありません。</p>
+      `,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Resend API error: ${res.status} ${text}`);
+  }
+}
+
 // sendSignupCodeEmailと同じ方式（Resendの/emails APIをSDKなしでfetchする素朴な実装。
 // Node18+のグローバルfetchを利用）で送る。
 // メールを見るだけで判断できるよう、通報内容をそのまま（escapeHtmlした上で）本文に載せる。
@@ -725,6 +805,8 @@ function buildApp(overrides = {}) {
       const keyHash = hashKey(key);
       let storeId = null;
       let role = null;
+      let supervisorId = null; // 時間帯責任者のときだけ入る（オーナーはnull）
+      let supervisorEmail = null;
 
       const { data: ownerStore, error: ownerErr } = await supabase
         .from('stores')
@@ -737,15 +819,24 @@ function buildApp(overrides = {}) {
         storeId = ownerStore.id;
         role = 'owner';
       } else {
+        // 【時間帯責任者への確定通知】idとemailも取得する。
+        // idは「この人が送った代理募集」をshifts.created_by_supervisor_idに記録するため、
+        // emailは確定通知の宛先と、ダッシュボードでの宛先表示のために使う。
+        // 【重要】ここで得たsupervisorIdは、以後「自分の行しか触れない」ことの根拠になる。
+        // 画面やリクエストボディから受け取ったIDは絶対に使わない（他人の通知先を
+        // 書き換えられてしまうため。/api/send-broadcastでstore_idをボディから受け取らない
+        // のと全く同じ理由）。
         const { data: supervisor, error: supErr } = await supabase
           .from('supervisor_keys')
-          .select('store_id')
+          .select('id, store_id, email')
           .eq('admin_key_hash', keyHash)
           .maybeSingle();
         if (supErr) throw supErr;
         if (supervisor) {
           storeId = supervisor.store_id;
           role = 'supervisor';
+          supervisorId = supervisor.id;
+          supervisorEmail = supervisor.email || null;
         }
       }
 
@@ -768,6 +859,8 @@ function buildApp(overrides = {}) {
       req.storeName = store.name;
       req.store = store;
       req.role = role;
+      req.supervisorId = supervisorId;
+      req.supervisorEmail = supervisorEmail;
       next();
     } catch (err) {
       console.error('auth error:', err);
@@ -827,6 +920,16 @@ function buildApp(overrides = {}) {
   const recoveryRequestCodeGlobalLimiter = overrides.recoveryRequestCodeGlobalLimiter || isRecoveryRequestCodeAllowedGlobally;
   const recoveryVerifyCodeIpLimiter = overrides.recoveryVerifyCodeIpLimiter || isRecoveryVerifyCodeAllowedByIp;
   const sendKeyRecoveryCodeEmailFn = overrides.sendKeyRecoveryCodeEmail || sendKeyRecoveryCodeEmail;
+
+  // 時間帯責任者の通知先登録（/api/me/email/*）も同じ理由で差し替え可能にする。
+  const sendSupervisorEmailCodeEmailFn =
+    overrides.sendSupervisorEmailCodeEmail || sendSupervisorEmailCodeEmail;
+  const supervisorEmailRequestLimiter =
+    overrides.supervisorEmailRequestLimiter || isSupervisorEmailRequestAllowed;
+  const supervisorEmailRequestGlobalLimiter =
+    overrides.supervisorEmailRequestGlobalLimiter || isSupervisorEmailRequestAllowedGlobally;
+  const supervisorEmailVerifyLimiter =
+    overrides.supervisorEmailVerifyLimiter || isSupervisorEmailVerifyAllowed;
   // AC-K6のタイミング対策の下限値。テストは通常0を注入して高速化するが、本番は必ず
   // 上のモジュールスコープの値（400ms/100ms）を使う。
   const keyRecoveryRequestMinResponseTimeMs =
@@ -1192,19 +1295,160 @@ function buildApp(overrides = {}) {
   // ログイン中の店長・時間帯責任者の店舗情報を返す（管理者キーに紐づく店舗）
   // emailは「代理出勤の確定通知の宛先」をダッシュボードに表示するために返す。
   // requireAdminで保護されているため、管理者キーを知っている本人にしか見えない。
-  // 【注意】emailはnullでありうる（古い登録・メール未設定）。その場合はnullを返し、
-  // 画面側で「メールアドレスが未設定です」と案内する（AC-M2）。
-  // 【AC-M5】emailはrequireAdminが既に取得済みのreq.storeから読む（DBに問い合わせ直さない）。
-  // requireAdminは認証のためにstoresの行をemail込みで取得しているため、ここで
-  // 再度selectするのは無駄な往復であり、しかも「認証で見た店舗」と「表示する
+  //
+  // 【AC-S8】emailは役割で中身が違う。
+  //   オーナー・店長     → stores.email（店舗登録時に確認したアドレス）
+  //   時間帯責任者       → supervisor_keys.email（本人が登録した自分のアドレス）
+  // 【重要】時間帯責任者にstores.email（オーナー個人の連絡先）を返してはいけない。
+  // キーを預かっただけの人に、オーナーの個人情報を開示する理由がない
+  // （管理者キーを共有させない、という運用方針と同じ考え方）。
+  //
+  // 【注意】どちらもnullでありうる（古い登録・未設定）。その場合はnullを返し、
+  // 画面側で「未設定です」と案内する（AC-M2）。
+  // 【AC-M5】requireAdminが既に取得済みの値（req.store / req.supervisorEmail）から読む。
+  // 再度selectするのは無駄な往復であり、しかも「認証で見た行」と「表示する
   // メールアドレス」が別クエリ由来になって食い違う余地を作ってしまう。
   app.get('/api/me', requireAdmin, (req, res) => {
+    const email =
+      req.role === 'supervisor' ? req.supervisorEmail || null : (req.store && req.store.email) || null;
     res.json({
       storeId: req.storeId,
       storeName: req.storeName,
       role: req.role,
-      email: (req.store && req.store.email) || null,
+      email,
+      // 画面が「登録する／変更する」の導線を出し分けるために使う。
+      // オーナーはこの画面からアドレスを変更できない（下のrequireSupervisor参照）。
+      canEditEmail: req.role === 'supervisor',
     });
+  });
+
+  // ==========================================================================
+  // 時間帯責任者の通知先メールアドレス（/api/me/email/*）
+  // ==========================================================================
+  // 【★最重要のセキュリティ判断：オーナーはこれらのAPIを使えない（403）】
+  // 一見すると「オーナーも自分のアドレスを変えられたほうが親切」に思えるが、
+  // stores.email は単なる通知先ではなく、
+  //   ① 管理者キー復旧（/api/recovery/*）の送り先
+  //   ② Stripeの請求・契約に紐づく連絡先
+  //   ③ 無料期間の使い回し防止(used_emails)の判定材料
+  // を兼ねている。画面から変更できるようにすると、管理者キーを盗んだ第三者が
+  // 「アドレスを自分のものに書き換える → キー復旧を実行する」だけで、
+  // 正規のオーナーを締め出してアカウントを完全に乗っ取れる経路ができる。
+  // オーナーのアドレス変更は、本人確認を伴う運営窓口(support@)での対応に限る。
+  //
+  // 時間帯責任者のアドレスは確定通知の宛先にしか使われないため、この経路は無い。
+  function requireSupervisor(req, res, next) {
+    if (req.role !== 'supervisor' || !req.supervisorId) {
+      return res.status(403).json({
+        error:
+          'この操作は時間帯責任者のみが行えます。オーナー・店長の通知先メールアドレスの変更をご希望の場合は、support@daida-store.jp までご連絡ください',
+      });
+    }
+    next();
+  }
+
+  // 通知先にしたいメールアドレスへ確認コードを送る。
+  // 【なぜ確認するのか】確定通知メールには応募したスタッフの氏名・店舗名・勤務日時が
+  // 含まれる。打ち間違えたまま登録されると、無関係の人にスタッフの個人情報が届き続け、
+  // スタッフ本人はそれに気づくことも止めることもできない。
+  app.post('/api/me/email/request-code', requireAdmin, requireSupervisor, async (req, res) => {
+    const email = String((req.body && req.body.email) || '').trim();
+
+    const issue = findEmailIssue(email);
+    if (issue) {
+      return res.status(400).json({ error: issue });
+    }
+
+    // 【重要】レート制限の判定は、DB書き込みやメール送信より前に行う。
+    // 後ろに置くと、上限に達していても1回分の送信が済んでしまう。
+    // キーは管理者キーそのものではなく時間帯責任者のID（キーをログや
+    // メモリ上のMapに残さないため。キーはパスワード相当の秘密である）。
+    if (!supervisorEmailRequestLimiter(req.supervisorId)) {
+      return res.status(429).json({
+        error: '確認コードの送信が続いています。1時間ほど時間をおいてから、もう一度お試しください',
+      });
+    }
+    if (!supervisorEmailRequestGlobalLimiter(SUPERVISOR_EMAIL_REQUEST_GLOBAL_RATE_LIMIT_KEY)) {
+      return res.status(429).json({
+        error: '現在、確認コードの送信が混み合っています。しばらく時間をおいてからお試しください',
+      });
+    }
+
+    try {
+      const code = generateSignupCode();
+      const expiresAt = new Date(Date.now() + SUPERVISOR_EMAIL_CODE_TTL_MINUTES * 60 * 1000).toISOString();
+
+      // 【重要】supervisorIdはrequireAdminが管理者キーから導出した値。
+      // リクエストボディのIDは一切使わないため、他人の行は構造的に触れない（AC-S6）。
+      await requestSupervisorEmailCode({
+        supabase,
+        supervisorId: req.supervisorId,
+        email,
+        codeHash: hashKey(code),
+        expiresAt,
+      });
+
+      await sendSupervisorEmailCodeEmailFn(email, code, req.storeName);
+
+      res.json({
+        message: `${email} に確認コードを送りました。${SUPERVISOR_EMAIL_CODE_TTL_MINUTES}分以内に入力してください`,
+      });
+    } catch (err) {
+      console.error('supervisor email request-code error:', err);
+      res.status(500).json({ error: '確認コードの送信に失敗しました' });
+    }
+  });
+
+  // 確認コードを検証し、一致したら通知先として登録する。
+  app.post('/api/me/email/verify-code', requireAdmin, requireSupervisor, async (req, res) => {
+    const code = String((req.body && req.body.code) || '').trim();
+    if (!code) {
+      return res.status(400).json({ error: '確認コードを入力してください' });
+    }
+
+    // レート制限は照合より前に消費する（L-5是正で確立した順序）。
+    if (!supervisorEmailVerifyLimiter(req.supervisorId)) {
+      return res.status(429).json({
+        error: '試行回数が多すぎます。しばらく時間をおいてからお試しください',
+      });
+    }
+
+    try {
+      // 試行枠の消費・定数時間でのハッシュ照合・一致時の昇格までを、
+      // 単一のRPC（＝1トランザクション）で不可分に行う。
+      const result = await verifySupervisorEmailCode({
+        supabase,
+        supervisorId: req.supervisorId,
+        code,
+        hashCode: hashKey,
+        maxAttempts: SUPERVISOR_EMAIL_CODE_MAX_ATTEMPTS,
+      });
+
+      if (!result.ok) {
+        // 該当なし・期限切れ・上限到達・コード不一致を区別しない（オラクル化を防ぐ）。
+        return res.status(400).json({ error: SUPERVISOR_EMAIL_VERIFY_FAILED_MESSAGE });
+      }
+
+      res.json({
+        message: '代理出勤の確定通知の宛先を登録しました',
+        email: result.email,
+      });
+    } catch (err) {
+      console.error('supervisor email verify-code error:', err);
+      res.status(500).json({ error: '確認に失敗しました' });
+    }
+  });
+
+  // 通知先の登録を解除する。確認コードは不要（自分の登録を消すだけで、
+  // 誰かに何かが届くようになるわけではないため）。
+  app.delete('/api/me/email', requireAdmin, requireSupervisor, async (req, res) => {
+    try {
+      await clearSupervisorEmail({ supabase, supervisorId: req.supervisorId });
+      res.json({ message: '確定通知の宛先を解除しました' });
+    } catch (err) {
+      console.error('supervisor email delete error:', err);
+      res.status(500).json({ error: '解除に失敗しました' });
+    }
   });
 
   // 課金状況（無料期間・今月の残り無料回数・契約中プラン等）をダッシュボードに返す
@@ -1330,17 +1574,31 @@ function buildApp(overrides = {}) {
   });
 
   // 時間帯責任者キーの一覧（キー自体は返さず、ラベルと発行日のみ）。オーナー・店長のみ。
+  //
+  // 【AC-S12】確定通知の宛先が登録済みかどうか(hasEmail)も返す。
+  // 【重要】アドレスそのものは返さない。オーナーに「誰がまだ登録していないか」を
+  // 知らせて登録を促すのが目的であり、本人の連絡先を見せる必要はない。
+  // オーナーが時間帯責任者の私用アドレスを一覧できてしまうと、本来の目的を超えた
+  // 個人情報の収集になる（プライバシーポリシー第3条の利用目的の範囲を超える）。
   app.get('/api/supervisors', requireAdmin, requireOwner, async (req, res) => {
     const { data, error } = await supabase
       .from('supervisor_keys')
-      .select('id, label, created_at')
+      .select('id, label, created_at, email')
       .eq('store_id', req.storeId)
       .order('created_at', { ascending: false });
     if (error) {
       console.error('list supervisors error:', error);
       return res.status(500).json({ error: '取得に失敗しました' });
     }
-    res.json(data || []);
+    // emailは真偽値に変換してから返す。selectした値をそのまま流さないこと。
+    res.json(
+      (data || []).map((s) => ({
+        id: s.id,
+        label: s.label,
+        created_at: s.created_at,
+        hasEmail: Boolean(s.email),
+      }))
+    );
   });
 
   // 時間帯責任者キーの失効。自分の店舗のキーしか消せない。オーナー・店長のみ。
@@ -1483,7 +1741,19 @@ function buildApp(overrides = {}) {
 
       const { data: shift, error: insErr } = await supabase
         .from('shifts')
-        .insert({ store_id: storeId, store_name: storeName, date, time, note: note || '' })
+        // 【AC-S1】誰が送ったかを記録する。代打が確定したとき、この人にも通知するため。
+        // nullは「オーナー・店長が送った」ことを意味する（req.supervisorIdは
+        // requireAdminがオーナーのときnullを入れている）。
+        // 【重要】リクエストボディからではなく、認証済みの管理者キーから決まる
+        // req.supervisorIdを使う（store_idと全く同じ理由。他人が送ったことにはできない）。
+        .insert({
+          store_id: storeId,
+          store_name: storeName,
+          date,
+          time,
+          note: note || '',
+          created_by_supervisor_id: req.supervisorId || null,
+        })
         .select()
         .single();
       if (insErr) throw insErr;
@@ -1630,8 +1900,15 @@ function buildApp(overrides = {}) {
         setImmediate(() => {
           const baseUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
-          // --- 店長へのメール通知（既存実装。挙動は変更していない） ---
+          // --- 店長・時間帯責任者へのメール通知 ---
           (async () => {
+            // 【AC-S1】宛先は2種類ある。
+            //   ① オーナー・店長（stores.email）… 常に送る。店の責任者として結果を把握する必要がある
+            //   ② その募集を送った時間帯責任者 … 自分が送った募集の結果を自分で確認できるように
+            // 【AC-S4】②は「その募集を送った本人」だけ。他の時間帯責任者には送らない。
+            // 全員に送ると、土曜担当の人に平日の確定通知まで届き、やがて全部読まれなくなる。
+            const recipients = [];
+
             // 通知先は店舗登録時に確認済みのメールアドレス(stores.email)。shiftsテーブルには
             // 店舗名(store_name)しか持たせていないため、宛先を得るためにstoresを引く。
             const { data: store, error: storeErr } = await supabase
@@ -1642,17 +1919,64 @@ function buildApp(overrides = {}) {
             if (storeErr) throw storeErr;
 
             // 【AC-N6】メール認証機能を追加する前に作られた古い店舗はstores.emailがnullの
-            // ことがある。その場合は送信をスキップする（エラーにはしない）。
-            if (!store || !store.email) return;
+            // ことがある。その場合はスキップする（エラーにはしない）。
+            if (store && store.email) recipients.push(store.email);
 
-            await sendShiftFilledNotificationEmailFn({
-              storeEmail: store.email,
-              storeName: data.store_name,
-              filledBy: data.filled_by,
-              date: data.date,
-              time: data.time,
-              note: data.note,
-            });
+            // 【AC-S3】送信者が時間帯責任者で、かつ本人が通知先を登録済みのときだけ追加する。
+            // 未登録（email is null）なら何もしない。エラーにはしない。
+            if (data.created_by_supervisor_id) {
+              const { data: sender, error: senderErr } = await supabase
+                .from('supervisor_keys')
+                .select('email')
+                .eq('id', data.created_by_supervisor_id)
+                .maybeSingle();
+              if (senderErr) throw senderErr;
+              if (sender && sender.email) recipients.push(sender.email);
+            }
+
+            // 【AC-S5】重複を除く。時間帯責任者がオーナーと同じアドレスを登録している場合
+            // （例：オーナー自身が時間帯責任者キーも持っている）に、同じ内容のメールが
+            // 2通届いてしまう。現場では「2通来た＝2件決まったのか？」と誤解される。
+            // 比較は小文字化して行う（メールアドレスのドメイン部は大小を区別しない。
+            // ローカル部は厳密には区別しうるが、区別する実運用はまず無く、
+            // ここでは「同じ人に2通送らない」ことを優先する）。
+            const uniqueRecipients = [];
+            const seen = new Set();
+            for (const address of recipients) {
+              const normalized = String(address).trim().toLowerCase();
+              if (seen.has(normalized)) continue;
+              seen.add(normalized);
+              uniqueRecipients.push(address);
+            }
+
+            if (uniqueRecipients.length === 0) return;
+
+            // 【AC-S9】1通の失敗が他の宛先への送信を止めないようにする。
+            // 直列にawaitすると、1通目で例外が出た時点で2通目が送られない。
+            // Promise.allSettled相当の扱いにして、失敗はログに残すだけにする。
+            const results = await Promise.all(
+              uniqueRecipients.map((storeEmail) =>
+                sendShiftFilledNotificationEmailFn({
+                  storeEmail,
+                  storeName: data.store_name,
+                  filledBy: data.filled_by,
+                  date: data.date,
+                  time: data.time,
+                  note: data.note,
+                }).then(
+                  () => null,
+                  (e) => {
+                    console.error('[ALERT] shift filled notification email failed for one recipient:', e);
+                    return e;
+                  }
+                )
+              )
+            );
+            // 全滅した場合だけ、下のcatchに拾わせて[ALERT]を1本にまとめる
+            // （1通でも届いていれば、現場は結果を知ることができている）。
+            if (results.every((r) => r !== null)) {
+              throw results[0];
+            }
           })().catch((e) => {
             // 【AC-N3・最重要】応募の確定(UPDATE)はすでに成功しており、応答も返却済みのため、
             // ここでの失敗（宛先取得の失敗・メール送信の失敗のどちらも含む）は応募そのものの

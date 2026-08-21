@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "verify-sql": "node scripts/verify-sql.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.8",
@@ -16,5 +17,8 @@
     "express": "^4.19.2",
     "stripe": "^17.4.0",
     "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.5"
   }
 }
