@@ -57,6 +57,12 @@
   /* M-3: 18歳未満の深夜勤務（22時〜翌5時）に関する注意書き・警告のスタイル */
   .minorNightNote { font-size: 12px; color: #666; background: #f4f6f9; padding: 8px 10px; border-radius: 6px; margin-top: 8px; line-height: 1.6; }
   .minorNightWarning { font-size: 13px; font-weight: bold; color: #b02a2a; background: #fdecec; border: 1px solid #f5c6c6; padding: 10px 12px; border-radius: 6px; margin-top: 8px; line-height: 1.6; }
+  /* 代理出勤の確定通知の宛先表示。長いメールアドレスでも折り返して全体が読めるようにする
+     （宛先が合っているかを確認するための表示なので、途中で切れては意味がない）。 */
+  .filledMailAddress { font-family: monospace; font-size: 14px; font-weight: bold; color: #1a4a6b; background: #eef5fa; border: 1px solid #bcd7e8; border-radius: 8px; padding: 12px 14px; margin: 10px 0; line-height: 1.7; word-break: break-all; }
+  .filledMailAddressMissing { font-family: inherit; font-weight: normal; color: #8a2e2e; background: #fdecec; border-color: #f5c6c6; word-break: normal; }
+  .filledMailAddressPlain { font-family: inherit; font-weight: normal; word-break: normal; }
+  .filledMailAddress a { color: #00639b; font-weight: bold; }
   .consentNote { font-size: 12px; color: #888; margin-top: 10px; line-height: 1.6; }
   .consentNote a { color: #00639b; }
   .siteFooter { max-width: 480px; margin: 20px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
@@ -160,16 +166,16 @@
   <div id="status" class="status"></div>
 </div>
 
-<!-- 確定通知の拡張（③店長へのプッシュ通知・AC-P5〜AC-P6）。
-     スタッフ登録(index.html)と同じWeb Pushの仕組みで、この端末に「代打が決まりました」の
-     通知だけを受け取れるようにする。急募（自分が送った代理募集）の通知はここでは
-     一切購読しない（スタッフ向け配信リスト(subscriptionsテーブル)とは別の
-     manager_subscriptionsテーブルに保存するため、届く心配がない。AC-P6）。 -->
-<div class="card" id="managerPushCard">
-  <h2>🔔 確定通知（プッシュ）</h2>
-  <p style="font-size:13px;color:#555;margin-top:-8px;">この端末で「代打が決まりました」の通知を受け取れます。自分が送った急募の通知はここでは届きません（急募はスタッフ向けの通知です）。</p>
-  <button id="managerPushBtn" onclick="enableManagerPushNotification()">🔔 この端末で確定通知を受け取る</button>
-  <div id="managerPushStatus" class="status"></div>
+<!-- 代理出勤が確定したときの通知先の案内（AC-M1〜AC-M3）。
+     店長へのプッシュ通知は取り消し、メールのみとした（詳細はserver.jsの
+     /api/manager-subscribeがあった箇所のコメントを参照）。
+     宛先を常時表示するのは、「通知が来ない」と言われたときに、まず宛先が
+     合っているかを店長自身が確認できるようにするため。 -->
+<div class="card" id="filledMailCard">
+  <h2>📧 代理出勤の確定通知</h2>
+  <p style="font-size:13px;color:#555;margin-top:-8px;">代打が決まると、その場で下のメールアドレス宛にお知らせが届きます。アプリを開いて確認する必要はありません。</p>
+  <div id="filledMailAddress" class="filledMailAddress">読み込み中...</div>
+  <p style="font-size:12px;color:#777;margin-bottom:0;">※ 宛先を変更したい場合は <a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。<br>※ 届かない場合は迷惑メールフォルダもご確認ください。</p>
 </div>
 
 <div class="card" id="planCard">
@@ -446,6 +452,7 @@ async function doLogin(key, statusEl, btn) {
     currentRole = data.role;
     upsertSavedKey({ key, storeName: data.storeName, role: data.role });
     document.getElementById('storeBadge').textContent = '🏬 ' + data.storeName;
+    renderFilledMailAddress(data.email);
     renderStaffLink();
     applyRoleVisibility();
     showDashboard();
@@ -986,70 +993,37 @@ function handleCheckoutRedirect() {
   }
 }
 
-// 確定通知の拡張（③店長へのプッシュ通知）。index.html の enablePushNotification() と
-// 同じWeb Pushの仕組みを使うが、保存先エンドポイントだけが異なる（/api/manager-subscribe。
-// スタッフ向けの/api/subscribeとは別のテーブル(manager_subscriptions)に保存されるため、
-// 急募の配信対象には混ざらない。AC-P6）。認証はログイン中の管理者キー(x-admin-key)で行う
-// ため、store_idを画面から送る必要はない（サーバー側が管理者キーから店舗を特定する）。
-async function enableManagerPushNotification() {
-  const btn = document.getElementById('managerPushBtn');
-  const statusEl = document.getElementById('managerPushStatus');
-
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-    statusEl.textContent = 'お使いのブラウザはプッシュ通知に対応していません。';
+// 代理出勤の確定通知の宛先を表示する（AC-M1〜AC-M3）。
+// 【AC-M2】emailはnullでありうる（古い登録・取得失敗）。その場合は空欄にせず、
+// 「未設定です」と明示して連絡先を案内する。空欄のままだと「通知は来るはず」と
+// 誤解したまま気づけないため。
+// 【AC-M3】メールアドレスは必ずescapeHtml()を通す。stores.emailは登録者が入力した
+// 値であり、そのままinnerHTMLに入れるとHTMLとして解釈されうるため。
+// 【AC-M4】時間帯責任者には実際のアドレスを見せない。stores.emailはオーナー個人の
+// 連絡先であり、キーを預かっただけの時間帯責任者に開示する理由がない
+// （管理者キーは共有しない、という運用方針と同じ考え方）。
+// 「どこに届くか」ではなく「メールで届く」ことだけ伝われば現場は困らない。
+function renderFilledMailAddress(email) {
+  const el = document.getElementById('filledMailAddress');
+  if (!el) return;
+  if (currentRole !== 'owner') {
+    el.textContent = '📧 オーナー・店長のご登録メールアドレス宛にお送りします。';
+    el.className = 'filledMailAddress filledMailAddressPlain';
     return;
   }
-
-  btn.disabled = true;
-  statusEl.textContent = '登録中...';
-  try {
-    const register = await navigator.serviceWorker.register('/sw.js');
-
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') {
-      statusEl.textContent = '通知が拒否されました。ブラウザの設定から許可してください。';
-      btn.disabled = false;
-      return;
-    }
-
-    const { publicKey } = await fetch('/api/vapid-public-key').then((r) => r.json());
-
-    const subscription = await register.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(publicKey),
-    });
-
-    const res = await fetch('/api/manager-subscribe', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify({ subscription }),
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      if (res.status === 401) {
-        handleUnauthorized();
-        return;
-      }
-      throw new Error(data.error || '登録に失敗しました');
-    }
-
-    statusEl.textContent = '✅ ' + data.message;
-  } catch (err) {
-    console.error(err);
-    statusEl.textContent = '登録中にエラーが発生しました：' + err.message;
-    btn.disabled = false;
+  if (email) {
+    el.className = 'filledMailAddress';
+    el.textContent = '📧 ' + email; // textContentなのでHTMLとして解釈されない（AC-M3）
+  } else {
+    el.className = 'filledMailAddress filledMailAddressMissing';
+    el.innerHTML = '⚠️ メールアドレスが未設定のため、確定通知をお送りできません。<a href="mailto:support@daida-store.jp">support@daida-store.jp</a> までご連絡ください。';
   }
 }
 
-// index.htmlのurlBase64ToUint8Array()と同じ変換処理（VAPID公開鍵の形式変換）。
-function urlBase64ToUint8Array(base64String) {
-  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
-  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
-  const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-  for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
-  return outputArray;
-}
+// 【取り消し済み】ここには enableManagerPushNotification() と、それが使う
+// urlBase64ToUint8Array()（VAPID公開鍵の形式変換）があった。店長へのプッシュ通知を
+// 取り消したことで、この画面はWeb Pushの仕組みを一切使わなくなったため両方削除した。
+// スタッフ側（index.html）のプッシュ購読はそのまま残っている。
 
 function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));

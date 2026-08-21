@@ -498,14 +498,16 @@ async function sendShiftFilledNotificationEmail({ storeEmail, storeName, filledB
 // 【②を震動なしにする理由・AC-P4】急募（sw.jsの既定vibrate、下のPUSH_VIBRATE_URGENTと同じ値）と
 // この終了通知が同じ強さで震動すると、本当の急募（行動が必要な通知）を見逃すようになる。
 // 終了通知は「お知らせ」であり行動を促すものではないため、震動を伴わない静かな通知にする
-// ことで体感的に区別できるようにする。①・③はいずれも「自分に関係がある確定の知らせ」で
+// ことで体感的に区別できるようにする。①は「自分に関係がある確定の知らせ」で
 // あり見逃されると困るため、急募と同じ強さ（PUSH_VIBRATE_URGENT）のままにする。
 const PUSH_VIBRATE_URGENT = [200, 100, 200]; // public/sw.jsの既定値（震動あり）と同じ値。急募・確定など見逃されて困る通知に使う
 const PUSH_VIBRATE_SILENT = []; // 震動なし。②「募集は終了しました」専用（AC-P4）
 
 const PUSH_TITLE_ASSIGNED_TO_ME = '代打が確定しました'; // ①応募した本人向け
 const PUSH_TITLE_CLOSED_FOR_OTHERS = '募集は終了しました'; // ②他のスタッフ向け
-const PUSH_TITLE_MANAGER_FILLED = '代打が決まりました'; // ③店長向け
+// ③店長向けのプッシュ（PUSH_TITLE_MANAGER_FILLED）は取り消した。店長への確定通知は
+// メール（sendShiftFilledNotificationEmail）のみ。理由は /api/manager-subscribe が
+// あった箇所のコメントを参照。
 
 function buildAssignedToMeBody(date, time) {
   return `${date} ${time} の代打はあなたに決まりました。よろしくお願いします。`;
@@ -513,12 +515,6 @@ function buildAssignedToMeBody(date, time) {
 function buildClosedForOthersBody(date, time) {
   return `${date} ${time} の代打募集は、他の方に決まりました。`;
 }
-// 店長向けは「あなたに」のような一人称の文言を使わない（店長自身が代打に入るわけではないため、
-// ①と読み違えられないようにするための表現の違い）。応募者名も分かるようにする。
-function buildManagerFilledBody(date, time, filledBy) {
-  return `${date} ${time} の代打に${filledBy}さんが決まりました。`;
-}
-
 // Web Push送信の実体（web-pushライブラリ）をラップするだけの薄い関数。
 // sendShiftFilledNotificationEmail等の他の通知関数と同じ理由（テストから実際の送信を
 // 発生させずに差し替え可能にするため）でoverrides経由に差し替え可能にする（buildApp内参照）。
@@ -1194,8 +1190,21 @@ function buildApp(overrides = {}) {
   });
 
   // ログイン中の店長・時間帯責任者の店舗情報を返す（管理者キーに紐づく店舗）
+  // emailは「代理出勤の確定通知の宛先」をダッシュボードに表示するために返す。
+  // requireAdminで保護されているため、管理者キーを知っている本人にしか見えない。
+  // 【注意】emailはnullでありうる（古い登録・メール未設定）。その場合はnullを返し、
+  // 画面側で「メールアドレスが未設定です」と案内する（AC-M2）。
+  // 【AC-M5】emailはrequireAdminが既に取得済みのreq.storeから読む（DBに問い合わせ直さない）。
+  // requireAdminは認証のためにstoresの行をemail込みで取得しているため、ここで
+  // 再度selectするのは無駄な往復であり、しかも「認証で見た店舗」と「表示する
+  // メールアドレス」が別クエリ由来になって食い違う余地を作ってしまう。
   app.get('/api/me', requireAdmin, (req, res) => {
-    res.json({ storeId: req.storeId, storeName: req.storeName, role: req.role });
+    res.json({
+      storeId: req.storeId,
+      storeName: req.storeName,
+      role: req.role,
+      email: (req.store && req.store.email) || null,
+    });
   });
 
   // 課金状況（無料期間・今月の残り無料回数・契約中プラン等）をダッシュボードに返す
@@ -1435,50 +1444,21 @@ function buildApp(overrides = {}) {
     }
   });
 
-  // 店長・時間帯責任者：確定通知（代打が決まりました）を受け取るためのPush Subscriptionを保存。
-  // 【③の実装・AC-P5】店長用ダッシュボード(manager.html)に、スタッフ登録(index.html)と同じ
-  // Web Pushの仕組みで購読する導線を追加した。
-  // 【AC-P6・最重要】ここで保存する購読は、スタッフ向け配信リスト(subscriptionsテーブル)には
-  // 一切書き込まない。別テーブル(manager_subscriptions)に保存することで、店長が
-  // /api/send-broadcast（自分が送った代理募集の通知）まで受け取ってしまう事態を
-  // 構造的に防ぐ（設計判断の詳細はsupabase/setup.sqlのmanager_subscriptionsテーブル定義の
-  // コメントを参照）。
-  // store_idはリクエストボディからではなく、認証済みの管理者キーから決まるreq.storeIdを使う
-  // （/api/send-broadcastと同じ理由。他店舗の店長として購読を登録することはできない）。
-  app.post('/api/manager-subscribe', requireAdmin, async (req, res) => {
-    const { subscription } = req.body || {};
-    if (!subscription || !subscription.endpoint) {
-      return res.status(400).json({ error: '不正なリクエストです' });
-    }
-    try {
-      const { data: existing, error: selErr } = await supabase
-        .from('manager_subscriptions')
-        .select('id')
-        .eq('endpoint', subscription.endpoint)
-        .maybeSingle();
-      if (selErr) throw selErr;
-
-      if (!existing) {
-        const { error: insErr } = await supabase
-          .from('manager_subscriptions')
-          .insert({ endpoint: subscription.endpoint, subscription, store_id: req.storeId });
-        if (insErr) throw insErr;
-      } else {
-        // 既に登録済みの端末が別の管理者キー（＝別店舗）でログインし直した場合は上書きする
-        // （/api/subscribeの既存の考え方と同じ）。
-        const { error: updErr } = await supabase
-          .from('manager_subscriptions')
-          .update({ store_id: req.storeId })
-          .eq('endpoint', subscription.endpoint);
-        if (updErr) throw updErr;
-      }
-
-      res.status(201).json({ message: '確定通知の宛先を保存しました' });
-    } catch (err) {
-      console.error('manager-subscribe error:', err);
-      res.status(500).json({ error: '宛先の保存に失敗しました' });
-    }
-  });
+  // 【取り消し済み】ここには以前 POST /api/manager-subscribe があり、店長・時間帯責任者が
+  // 確定通知（代打が決まりました）をプッシュ通知で受け取るための購読を
+  // manager_subscriptions テーブルに保存していた。
+  //
+  // 【なぜ取り消したか】運営者の判断により、店長向けの確定通知はメール
+  // （stores.email宛。sendShiftFilledNotificationEmail）のみとした。理由は3つ:
+  //   1. メール通知は実質スマホ通知として機能する（Gmailアプリ等が受信時に通知を出す）
+  //   2. プッシュは購読の手間（ボタン操作・通知許可・iPhoneならホーム画面追加）が
+  //      かかり、これから最初の顧客を獲得する段階で導入の壁を増やしたくない
+  //   3. テーブル・エンドポイント・UI・解除導線がすべて不要になる
+  // 代わりに、登録完了画面(signup.html)と店長用ダッシュボード(manager.html)に
+  // 「確定通知はメールで届く」旨と実際の宛先アドレスを表示している。
+  //
+  // なお、スタッフ向けのプッシュ（①応募者本人・②他のスタッフ）は残している。
+  // スタッフは代理募集を受け取るために既に購読済みで、追加の手間が無いため。
 
   // オーナー・店長／時間帯責任者：ヘルプ募集を自分の店舗のスタッフに配信
   // 店舗はリクエストボディからではなく、ログインに使った管理者キーから決まる。
@@ -1754,53 +1734,10 @@ function buildApp(overrides = {}) {
             console.error('[ALERT] shift filled push notification (staff) failed (response already sent):', e);
           });
 
-          // --- ③店長へのプッシュ通知 ---
-          (async () => {
-            // 【AC-P6・最重要】ここではmanager_subscriptions（店長専用の別テーブル）のみを
-            // 見る。subscriptions（スタッフ向け配信リスト）には一切触れない。これにより、
-            // 店長が自分の送った代理募集(急募)の通知まで受け取ってしまう事態を構造的に防ぐ
-            // （店長が受け取るのは「確定」だけ、という要件）。
-            const { data: managerSubs, error: managerSubsErr } = await supabase
-              .from('manager_subscriptions')
-              .select('*')
-              .eq('store_id', data.store_id);
-            if (managerSubsErr) throw managerSubsErr;
-
-            const payload = JSON.stringify({
-              title: PUSH_TITLE_MANAGER_FILLED,
-              body: buildManagerFilledBody(data.date, data.time, data.filled_by),
-              url: `${baseUrl}/manager.html`,
-              vibrate: PUSH_VIBRATE_URGENT,
-            });
-
-            const staleEndpoints = [];
-            await Promise.all(
-              (managerSubs || []).map(async (s) => {
-                try {
-                  await sendPushNotificationFn(s.subscription, payload);
-                } catch (err) {
-                  if (isStalePushSubscriptionError(err)) {
-                    staleEndpoints.push(s.endpoint);
-                  }
-                  console.error(
-                    '[ALERT] shift filled push notification (manager) send failed:',
-                    s.endpoint,
-                    err && err.statusCode
-                  );
-                }
-              })
-            );
-
-            if (staleEndpoints.length) {
-              const { error: delErr } = await supabase
-                .from('manager_subscriptions')
-                .delete()
-                .in('endpoint', staleEndpoints);
-              if (delErr) console.error('shift filled push (manager): stale subscription cleanup failed:', delErr);
-            }
-          })().catch((e) => {
-            console.error('[ALERT] shift filled push notification (manager) failed (response already sent):', e);
-          });
+          // 【取り消し済み】ここには以前「③店長へのプッシュ通知」があった。
+          // 運営者の判断により、店長への確定通知はメール（下の
+          // sendShiftFilledNotificationEmailFn）のみとしたため削除した。
+          // 理由の詳細は /api/manager-subscribe があった箇所のコメントを参照。
         });
         return;
       }

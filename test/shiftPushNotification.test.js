@@ -1,9 +1,14 @@
 'use strict';
 
-// 確定通知の拡張：代打（欠員募集）の応募が確定したときに送る3方向のプッシュ通知の検証。
-//   ①応募した本人へ（「あなたに決まりました」）
-//   ②他のスタッフへ（「他の方に決まりました」）
-//   ③店長へ（「代打が決まりました」。店長用ダッシュボード(manager.html)からの購読が必要）
+// 確定通知：代打（欠員募集）の応募が確定したときに送る通知の検証。
+//   ①応募した本人へ（プッシュ「あなたに決まりました」）
+//   ②他のスタッフへ（プッシュ「他の方に決まりました」）
+//   ③店長へ（メールのみ。stores.email宛）
+//
+// 【③について】当初は店長にもプッシュ通知を送る実装
+// （/api/manager-subscribe と manager_subscriptions テーブル）を入れたが、
+// 運営者の判断で取り消し、メールのみとした。AC-P5・AC-P6は
+// 「プッシュが復活していないこと」を確認する回帰防止テストに差し替えている。
 //
 // 【背景】直前のコミットで「代打が確定したら店長にメールを送る」機能を追加したが、
 // 応募した本人は「あとで見返せる記録」を持てず、他のスタッフは通知を受けて開いたら
@@ -15,8 +20,8 @@
 //   AC-P2: 他のスタッフに「他の方に決まりました」が届く
 //   AC-P3: ①と②の文面が異なる（★特に重要）
 //   AC-P4: ②は震動しない設定で送られる（★特に重要）
-//   AC-P5: 店長が通知を購読していれば、確定時にプッシュが届く
-//   AC-P6: 店長には代理募集の通知が届かない（★特に重要）
+//   AC-P5: 店長へはプッシュを送らず、メールで通知する（差し替え済み）
+//   AC-P6: 店長プッシュの購読口が存在しない（★特に重要・回帰防止）
 //   AC-P7: endpointが送られてこない場合、全員に②が届く
 //   AC-P8: 1人分の送信が失敗しても、他の人への送信が続行される（★特に重要）
 //   AC-P9: 通知の失敗で応募の確定が失敗扱いにならない
@@ -84,8 +89,33 @@ function postJson(server, path, body, headers = {}) {
   });
 }
 
+// postJson()はレスポンスをJSONとして解釈するため、存在しないパス（Expressの既定の
+// 404はHTMLを返す）の確認には使えない。ステータスコードだけを見たい場合に使う。
+function postRaw(server, path, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const { port } = server.address();
+    const payload = JSON.stringify(body);
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method: 'POST',
+        path,
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), ...headers },
+      },
+      (res) => {
+        let responseBody = '';
+        res.on('data', (chunk) => (responseBody += chunk));
+        res.on('end', () => resolve({ status: res.statusCode, text: responseBody }));
+      }
+    );
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
 // ============================================================
-// フェイクSupabase：shifts・stores・subscriptions・manager_subscriptionsを模す。
+// フェイクSupabase：shifts・stores・subscriptionsを模す。
 // server.js本体が使う正確なメソッドチェーンだけをサポートする最小実装
 // （test/shiftNotification.test.jsのフェイクと同じ設計方針）。
 // ============================================================
@@ -103,17 +133,15 @@ function filterChain(rows) {
   };
 }
 
-function createFakeSupabase({ shifts = [], stores = [], subscriptions = [], managerSubscriptions = [] } = {}) {
+function createFakeSupabase({ shifts = [], stores = [], subscriptions = [] } = {}) {
   const shiftsArr = shifts.map((s) => ({ ...s }));
   const storesArr = stores.map((s) => ({ ...s }));
   const subscriptionsArr = subscriptions.map((s) => ({ ...s }));
-  const managerSubscriptionsArr = managerSubscriptions.map((s) => ({ ...s }));
 
   const supabase = {
     shiftsArr,
     storesArr,
     subscriptionsArr,
-    managerSubscriptionsArr,
     from(table) {
       if (table === 'shifts') {
         return {
@@ -170,46 +198,10 @@ function createFakeSupabase({ shifts = [], stores = [], subscriptions = [], mana
           },
         };
       }
-      if (table === 'manager_subscriptions') {
-        return {
-          select() {
-            return filterChain(managerSubscriptionsArr);
-          },
-          insert(row) {
-            managerSubscriptionsArr.push({
-              id: `mgrsub-${managerSubscriptionsArr.length + 1}`,
-              registered_at: new Date().toISOString(),
-              ...row,
-            });
-            return Promise.resolve({ data: null, error: null });
-          },
-          update(payload) {
-            let matched = managerSubscriptionsArr;
-            const chain = {
-              eq(col, val) {
-                matched = matched.filter((r) => r[col] === val);
-                return chain;
-              },
-              then(resolve, reject) {
-                matched.forEach((r) => Object.assign(r, payload));
-                return Promise.resolve({ data: null, error: null }).then(resolve, reject);
-              },
-            };
-            return chain;
-          },
-          delete() {
-            return {
-              in(col, vals) {
-                const targets = new Set(vals);
-                for (let i = managerSubscriptionsArr.length - 1; i >= 0; i--) {
-                  if (targets.has(managerSubscriptionsArr[i][col])) managerSubscriptionsArr.splice(i, 1);
-                }
-                return Promise.resolve({ data: null, error: null });
-              },
-            };
-          },
-        };
-      }
+      // 【重要】manager_subscriptionsは意図的にサポートしない。店長への確定通知は
+      // メールのみとしたため、このテーブルへのアクセスが復活したら、それは
+      // 「取り消したはずの店長プッシュが戻ってきた」ことを意味する。
+      // その場合はここで例外が投げられ、テストが失敗して気づける（回帰の検知）。
       throw new Error(`想定外のテーブルアクセス: ${table}`);
     },
   };
@@ -274,7 +266,9 @@ function buildTestApp({ supabase, failEndpoints = {}, emailFn } = {}) {
 
 const PUSH_TITLE_ASSIGNED_TO_ME = '代打が確定しました';
 const PUSH_TITLE_CLOSED_FOR_OTHERS = '募集は終了しました';
-const PUSH_TITLE_MANAGER_FILLED = '代打が決まりました';
+// 【取り消し済みの文面】店長向けプッシュ③のタイトル。実装からは削除済みで、
+// 「これが送られていないこと」を確認するためだけにテスト側で保持している。
+const REMOVED_PUSH_TITLE_MANAGER_FILLED = '代打が決まりました';
 
 // ============================================================
 // AC-P1: 応募が確定すると、応募した本人に「あなたに決まりました」が届く
@@ -488,76 +482,108 @@ test('異常系(回帰防止・AC-P4): ①（本人向け）は震動なし(空�
 });
 
 // ============================================================
-// AC-P5: 店長が通知を購読していれば、確定時にプッシュが届く
+// AC-P5（差し替え）: 店長へのプッシュ通知は行わない（メールのみ）
+//
+// 【AC-P5・AC-P6が変わった経緯】当初は店長にもプッシュ通知を送る実装
+// （/api/manager-subscribe と manager_subscriptions テーブル）を入れたが、
+// 運営者の判断で取り消し、店長への確定通知はメールのみとした。
+// 理由：メールは実質スマホ通知として機能するうえ、購読操作（通知許可・iPhoneなら
+// ホーム画面追加）という導入の壁を無くせるため。
+// そこで、旧AC-P5/P6のテストを「プッシュが届くこと」の確認から
+// 「プッシュが復活していないこと」の回帰防止に置き換えた。
 // ============================================================
 
-test('正常系(AC-P5): /api/manager-subscribeで購読した店長には、③「代打が決まりました」が届く', async () => {
+test('正常系(AC-P5): 応募が確定しても、店長宛のプッシュ通知は一切送られない（宛先はスタッフの購読のみ）', async () => {
   const applicantSub = makeSub({ endpoint: 'https://push.example.com/p5-applicant', staff_name: '山田太郎' });
-  const supabase = createFakeSupabase({ shifts: [BASE_SHIFT], stores: [BASE_STORE], subscriptions: [applicantSub] });
+  const otherSub = makeSub({ endpoint: 'https://push.example.com/p5-other', staff_name: '鈴木花子' });
+  const supabase = createFakeSupabase({
+    shifts: [BASE_SHIFT],
+    stores: [BASE_STORE],
+    subscriptions: [applicantSub, otherSub],
+  });
   const { app, pushCalls } = buildTestApp({ supabase });
   const server = app.listen(0);
   try {
-    const subRes = await postJson(
-      server,
-      '/api/manager-subscribe',
-      { subscription: { endpoint: 'https://push.example.com/manager-1', keys: { p256dh: 'x', auth: 'y' } } },
-      { 'x-admin-key': OWNER_ADMIN_KEY }
-    );
-    assert.strictEqual(subRes.status, 201);
-
-    const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, { name: '山田太郎' });
+    const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, {
+      name: '山田太郎',
+      endpoint: applicantSub.endpoint,
+    });
     assert.strictEqual(res.status, 200);
-    await waitFor(() => pushCalls.some((c) => c.endpoint === 'https://push.example.com/manager-1'));
-
-    const toManager = pushCalls.find((c) => c.endpoint === 'https://push.example.com/manager-1');
-    assert.strictEqual(toManager.payload.title, PUSH_TITLE_MANAGER_FILLED);
-    assert.strictEqual(toManager.payload.body, '2026-08-20 18:00〜22:00 の代打に山田太郎さんが決まりました。');
-  } finally {
-    server.close();
-  }
-});
-
-test('異常系(AC-P5): 店長が誰も購読していない場合でも、応募は成功しエラーにならない（送信対象0件）', async () => {
-  const applicantSub = makeSub({ endpoint: 'https://push.example.com/p5b-applicant', staff_name: '山田太郎' });
-  const supabase = createFakeSupabase({ shifts: [BASE_SHIFT], stores: [BASE_STORE], subscriptions: [applicantSub] });
-  const { app, pushCalls } = buildTestApp({ supabase });
-  const server = app.listen(0);
-  try {
-    const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, { name: '山田太郎' });
-    assert.strictEqual(res.status, 200);
+    await waitFor(() => pushCalls.length === 2);
+    // 追加の送信が遅れて発生しないことも確認する（応答後の非同期処理の取りこぼし防止）。
     await delay(50);
-    assert.strictEqual(pushCalls.filter((c) => c.payload.title === PUSH_TITLE_MANAGER_FILLED).length, 0);
+
+    assert.strictEqual(pushCalls.length, 2, 'プッシュはスタッフ2人分だけのはず');
+    // 送信先は、購読しているスタッフのendpointのみ。
+    const endpoints = pushCalls.map((c) => c.endpoint).sort();
+    assert.deepStrictEqual(endpoints, [applicantSub.endpoint, otherSub.endpoint].sort());
+    // 取り消した③の文面が復活していないこと。
+    assert.ok(
+      !pushCalls.some((c) => c.payload.title === REMOVED_PUSH_TITLE_MANAGER_FILLED),
+      '店長向けの旧文面「代打が決まりました」が送られてはいけない'
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('正常系(AC-P5): 店長への確定通知はメールで送られる（プッシュに代わる手段が実際に動く）', async () => {
+  const applicantSub = makeSub({ endpoint: 'https://push.example.com/p5c-applicant', staff_name: '山田太郎' });
+  const supabase = createFakeSupabase({ shifts: [BASE_SHIFT], stores: [BASE_STORE], subscriptions: [applicantSub] });
+  const emailCalls = [];
+  const { app } = buildTestApp({
+    supabase,
+    emailFn: async (...args) => {
+      emailCalls.push(args);
+    },
+  });
+  const server = app.listen(0);
+  try {
+    const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, { name: '山田太郎' });
+    assert.strictEqual(res.status, 200);
+    await waitFor(() => emailCalls.length === 1);
+    // 宛先が店舗のメールアドレス（stores.email）であること。
+    assert.ok(
+      JSON.stringify(emailCalls[0]).includes(BASE_STORE.email),
+      '確定通知メールはstores.email宛に送られるはず'
+    );
   } finally {
     server.close();
   }
 });
 
 // ============================================================
-// AC-P6（最重要）: 店長には代理募集の通知が届かない（スタッフ向け配信に混ざっていない）
+// AC-P6（差し替え・最重要）: 店長プッシュの購読口が存在しない
+//
+// 実装を消しただけでは、後から「あった方が良さそうだ」と復活してしまいうる。
+// エンドポイントが無いこと・manager_subscriptionsに触れないことを明示的に固定する。
+// （フェイクSupabaseは manager_subscriptions へのアクセスで例外を投げるため、
+//   実装が復活すれば下のテストで気づける。）
 // ============================================================
 
-test('正常系(AC-P6・核心): 店長の購読は、スタッフ向け配信リスト(subscriptions)には保存されない', async () => {
+test('正常系(AC-P6・核心): /api/manager-subscribe は存在しない（404であり、購読は作られない）', async () => {
   const supabase = createFakeSupabase({ shifts: [BASE_SHIFT], stores: [BASE_STORE] });
   const { app } = buildTestApp({ supabase });
   const server = app.listen(0);
   try {
-    const subRes = await postJson(
+    const subRes = await postRaw(
       server,
       '/api/manager-subscribe',
       { subscription: { endpoint: 'https://push.example.com/manager-2', keys: { p256dh: 'x', auth: 'y' } } },
       { 'x-admin-key': OWNER_ADMIN_KEY }
     );
-    assert.strictEqual(subRes.status, 201);
-
-    assert.strictEqual(supabase.subscriptionsArr.length, 0, 'subscriptions(スタッフ向け配信リスト)には何も保存されないはず');
-    assert.strictEqual(supabase.managerSubscriptionsArr.length, 1, 'manager_subscriptionsに1件保存されるはず');
-    assert.strictEqual(supabase.managerSubscriptionsArr[0].endpoint, 'https://push.example.com/manager-2');
+    assert.strictEqual(subRes.status, 404, '取り消したエンドポイントが復活していないこと');
+    assert.strictEqual(
+      supabase.subscriptionsArr.length,
+      0,
+      'スタッフ向け配信リスト(subscriptions)にも何も保存されないこと'
+    );
   } finally {
     server.close();
   }
 });
 
-test('異常系(AC-P6・核心): 店長が購読していても、店長の端末には①②（スタッフ向けの文面）が一切届かない', async () => {
+test('異常系(AC-P6・核心): 応募の確定処理は manager_subscriptions テーブルを一切参照しない', async () => {
   const winnerSub = makeSub({ endpoint: 'https://push.example.com/p6-winner', staff_name: '山田太郎' });
   const otherSub = makeSub({ endpoint: 'https://push.example.com/p6-other', staff_name: '鈴木花子' });
   const supabase = createFakeSupabase({
@@ -565,35 +591,30 @@ test('異常系(AC-P6・核心): 店長が購読していても、店長の端�
     stores: [BASE_STORE],
     subscriptions: [winnerSub, otherSub],
   });
+  // フェイクSupabaseは manager_subscriptions で例外を投げる。その例外が
+  // 応答後の非同期処理の中で握りつぶされても気づけるよう、from()の呼び出しを直接記録する。
+  const touchedTables = [];
+  const originalFrom = supabase.from.bind(supabase);
+  supabase.from = (table) => {
+    touchedTables.push(table);
+    return originalFrom(table);
+  };
   const { app, pushCalls } = buildTestApp({ supabase });
   const server = app.listen(0);
   try {
-    const managerEndpoint = 'https://push.example.com/manager-3';
-    await postJson(
-      server,
-      '/api/manager-subscribe',
-      { subscription: { endpoint: managerEndpoint, keys: { p256dh: 'x', auth: 'y' } } },
-      { 'x-admin-key': OWNER_ADMIN_KEY }
-    );
-
     const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, {
       name: '山田太郎',
       endpoint: winnerSub.endpoint,
     });
     assert.strictEqual(res.status, 200);
-    // 3件（本人・他スタッフ・店長）が送られるまで待つ。
-    await waitFor(() => pushCalls.length === 3);
+    await waitFor(() => pushCalls.length === 2);
+    await delay(50);
 
-    const managerCalls = pushCalls.filter((c) => c.endpoint === managerEndpoint);
-    assert.strictEqual(managerCalls.length, 1, '店長には1件だけ届くはず（確定通知のみ）');
-    assert.strictEqual(managerCalls[0].payload.title, PUSH_TITLE_MANAGER_FILLED);
-    assert.notStrictEqual(managerCalls[0].payload.title, PUSH_TITLE_ASSIGNED_TO_ME);
-    assert.notStrictEqual(managerCalls[0].payload.title, PUSH_TITLE_CLOSED_FOR_OTHERS);
-
-    // 逆方向の確認：スタッフ向けの2件(①②)の宛先に店長のendpointが紛れ込んでいないこと。
-    const staffCalls = pushCalls.filter((c) => c.endpoint !== managerEndpoint);
-    assert.strictEqual(staffCalls.length, 2);
-    assert.ok(!staffCalls.some((c) => c.payload.title === PUSH_TITLE_MANAGER_FILLED));
+    assert.ok(
+      !touchedTables.includes('manager_subscriptions'),
+      'manager_subscriptionsに触れてはいけない（店長プッシュの復活を検知）'
+    );
+    assert.strictEqual(pushCalls.length, 2, 'プッシュはスタッフ2人分だけのはず');
   } finally {
     server.close();
   }
@@ -693,40 +714,40 @@ test('正常系(AC-P8・核心): スタッフ向け送信で先頭の1件が失�
   }
 });
 
-test('異常系(AC-P8): 店長側の送信でも、1件の失敗が他の店長端末への送信を止めない', async () => {
-  const applicantSub = makeSub({ endpoint: 'https://push.example.com/p8b-applicant', staff_name: '山田太郎' });
-  const supabase = createFakeSupabase({ shifts: [BASE_SHIFT], stores: [BASE_STORE], subscriptions: [applicantSub] });
-  const failingManagerEndpoint = 'https://push.example.com/mgr-fail';
-  const okManagerEndpoint = 'https://push.example.com/mgr-ok';
-  const staleError = new Error('Not Found (simulated)');
-  staleError.statusCode = 404;
+// 【差し替え】ここには「店長側の送信でも、1件の失敗が他の店長端末への送信を止めない」
+// というテストがあったが、店長へのプッシュ自体を取り消したため成立しなくなった。
+// 代わりに、店長への通知手段（メール）とスタッフへの通知手段（プッシュ）が
+// 互いに独立していることを確認する。店長への通知がメール1本になった以上、
+// 「メールが落ちたらスタッフにも届かない」という巻き添えが起きないことは重要。
+test('異常系(AC-P8): 店長へのメール送信が失敗しても、スタッフ全員へのプッシュは送られる', async () => {
+  const winnerSub = makeSub({ endpoint: 'https://push.example.com/p8b-winner', staff_name: '山田太郎' });
+  const otherSub = makeSub({ endpoint: 'https://push.example.com/p8b-other', staff_name: '鈴木花子' });
+  const supabase = createFakeSupabase({
+    shifts: [BASE_SHIFT],
+    stores: [BASE_STORE],
+    subscriptions: [winnerSub, otherSub],
+  });
   const { app, pushCalls } = buildTestApp({
     supabase,
-    failEndpoints: { [failingManagerEndpoint]: staleError },
+    emailFn: async () => {
+      throw new Error('mail boom (simulated)');
+    },
   });
   const server = app.listen(0);
   try {
-    // failするほうを先に登録する（配列の先頭に来るようにする）。
-    await postJson(
-      server,
-      '/api/manager-subscribe',
-      { subscription: { endpoint: failingManagerEndpoint, keys: { p256dh: 'x', auth: 'y' } } },
-      { 'x-admin-key': OWNER_ADMIN_KEY }
-    );
-    await postJson(
-      server,
-      '/api/manager-subscribe',
-      { subscription: { endpoint: okManagerEndpoint, keys: { p256dh: 'x', auth: 'y' } } },
-      { 'x-admin-key': OWNER_ADMIN_KEY }
-    );
-
-    const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, { name: '山田太郎' });
+    const res = await postJson(server, `/api/shift/${BASE_SHIFT.id}/respond`, {
+      name: '山田太郎',
+      endpoint: winnerSub.endpoint,
+    });
     assert.strictEqual(res.status, 200);
-    await waitFor(() => pushCalls.some((c) => c.endpoint === okManagerEndpoint));
-    assert.ok(pushCalls.some((c) => c.endpoint === failingManagerEndpoint));
+    await waitFor(() => pushCalls.length === 2);
 
-    await waitFor(() => !supabase.managerSubscriptionsArr.some((s) => s.endpoint === failingManagerEndpoint));
-    assert.ok(supabase.managerSubscriptionsArr.some((s) => s.endpoint === okManagerEndpoint));
+    const toWinner = pushCalls.find((c) => c.endpoint === winnerSub.endpoint);
+    const toOther = pushCalls.find((c) => c.endpoint === otherSub.endpoint);
+    assert.ok(toWinner, 'メールが失敗しても本人へのプッシュは送られるはず');
+    assert.ok(toOther, 'メールが失敗しても他スタッフへのプッシュは送られるはず');
+    assert.strictEqual(toWinner.payload.title, PUSH_TITLE_ASSIGNED_TO_ME);
+    assert.strictEqual(toOther.payload.title, PUSH_TITLE_CLOSED_FOR_OTHERS);
   } finally {
     server.close();
   }
@@ -736,7 +757,7 @@ test('異常系(AC-P8): 店長側の送信でも、1件の失敗が他の店長�
 // AC-P9: 通知の失敗で応募の確定が失敗扱いにならない
 // ============================================================
 
-test('正常系(AC-P9): メール・①②・③のすべてが失敗しても、応募の応答は200のまま変わらない', async () => {
+test('正常系(AC-P9): メールと①②のすべてが失敗しても、応募の応答は200のまま変わらない', async () => {
   const winnerSub = makeSub({ endpoint: 'https://push.example.com/p9-winner', staff_name: '山田太郎' });
   const supabase = createFakeSupabase({ shifts: [BASE_SHIFT], stores: [BASE_STORE], subscriptions: [winnerSub] });
   const boom = new Error('boom');
@@ -892,7 +913,7 @@ test('異常系(AC-P10): 購読一覧の取得(DB照会)が遅くても、応募
 // AC-P11（最重要）: 先着で負けた応募では、これらの通知が送られない
 // ============================================================
 
-test('正常系(AC-P11・核心): 既に確定済みの募集へ応募（409）した場合、①②③のいずれも送られない', async () => {
+test('正常系(AC-P11・核心): 既に確定済みの募集へ応募（409）した場合、①②のいずれも送られない', async () => {
   const alreadyFilledShift = {
     ...BASE_SHIFT,
     id: 'shift-p11-filled',
@@ -902,17 +923,15 @@ test('正常系(AC-P11・核心): 既に確定済みの募集へ応募（409）�
   };
   const sub = makeSub({ endpoint: 'https://push.example.com/p11-late', staff_name: '後から来た人' });
   const supabase = createFakeSupabase({ shifts: [alreadyFilledShift], stores: [BASE_STORE], subscriptions: [sub] });
-  const { app, pushCalls } = buildTestApp({ supabase });
+  const emailCalls = [];
+  const { app, pushCalls } = buildTestApp({
+    supabase,
+    emailFn: async (...args) => {
+      emailCalls.push(args);
+    },
+  });
   const server = app.listen(0);
   try {
-    // 事前に店長を購読させておき、③も送られていないことを確認できるようにする。
-    await postJson(
-      server,
-      '/api/manager-subscribe',
-      { subscription: { endpoint: 'https://push.example.com/p11-manager', keys: { p256dh: 'x', auth: 'y' } } },
-      { 'x-admin-key': OWNER_ADMIN_KEY }
-    );
-
     const res = await postJson(server, `/api/shift/${alreadyFilledShift.id}/respond`, {
       name: '後から来た人',
       endpoint: sub.endpoint,
@@ -920,6 +939,8 @@ test('正常系(AC-P11・核心): 既に確定済みの募集へ応募（409）�
     assert.strictEqual(res.status, 409);
     await delay(50);
     assert.strictEqual(pushCalls.length, 0, '先着で負けた場合はいずれの通知も送られないはず');
+    // 店長へのメールも送られない（「決まりました」が二重に届くと現場が混乱するため）。
+    assert.strictEqual(emailCalls.length, 0, '先着で負けた応募では店長へのメールも送られないはず');
   } finally {
     server.close();
   }

@@ -51,29 +51,15 @@ create table if not exists subscriptions (
   registered_at timestamptz not null default now()
 );
 
--- 店長・時間帯責任者向けの確定通知（代打が決まりました）専用のPush Subscription。
--- 【確定通知の拡張・AC-P5〜AC-P6】直前まではメールのみだった店長向けの確定通知に、
--- プッシュ通知でも受け取れる導線（manager.html）を追加した。
--- 【なぜsubscriptions（スタッフ向け配信リスト）に混ぜないか・AC-P6の核心】
--- subscriptionsは/api/send-broadcastが「その店舗のスタッフ全員」に代理募集(急募)を
--- 配信する際の宛先リストとして使われている。店長の購読をここに混ぜてしまうと、
--- 店長は自分がまさに送信した急募通知まで自分の端末で受け取ってしまい煩わしいだけでなく、
--- 「店長の行は除外する」という条件分岐を、スタッフ向け配信のクエリすべてに書き忘れなく
--- 徹底する運用に頼ることになる。この失敗パターンは、key_recovery_requestsを
--- pending_signupsから分離した際に採った判断（「役割を区別する列を1つのテーブルに足す案は、
--- WHERE句の書き忘れで取り違えが再発しうるため採らなかった」）と全く同じであるため、
--- ここでも同じ理由でテーブルを完全に分離する。これにより、代理募集の配信コードは
--- 常にsubscriptionsだけを見ればよく、確定通知（店長向けプッシュ）のコードは常に
--- このmanager_subscriptionsだけを見ればよくなり、取り違えが構造的に起こらなくなる。
--- store_idは一意にしない（subscriptionsテーブルと同じ考え方。店長が複数端末
--- （スマホ＋PC等）から購読する場合を想定し、endpointを実質的な一意キーとして扱う）。
-create table if not exists manager_subscriptions (
-  id uuid primary key default gen_random_uuid(),
-  store_id uuid not null references stores(id) on delete cascade,
-  endpoint text unique not null,
-  subscription jsonb not null,
-  registered_at timestamptz not null default now()
-);
+-- 【取り消し済み】ここには manager_subscriptions テーブル（店長・時間帯責任者向けの
+-- 確定通知プッシュの購読先）の定義があったが、店長への確定通知はメールのみとする
+-- 判断により削除した（理由は server.js の /api/manager-subscribe があった箇所の
+-- コメントを参照）。
+-- 【本番DBへの適用について】このテーブルは本番・stagingのどちらにも作成されていない
+-- （作成手順を実施する前に方針を変更したため）。したがって drop table は不要。
+-- 万一どこかの環境に存在する場合は、参照するコードが無くなったので
+--   drop table if exists manager_subscriptions;
+-- を手動で実行してよい。
 
 -- 急募（シフト応援）の履歴と状態
 create table if not exists shifts (
@@ -361,14 +347,14 @@ grant execute on function request_signup_code(text, text, text, timestamptz, int
 -- Data APIから完全に切り離しておく。
 --
 -- この一覧は本ファイルに定義されている全テーブル（stores, supervisor_keys,
--- pending_signups, subscriptions, manager_subscriptions, shifts, app_config,
+-- pending_signups, subscriptions, shifts, app_config,
 -- stripe_events, used_emails, reports, key_recovery_requests）を網羅している。
 -- 新しいテーブルを追加した場合は、ここにも追記すること（key_recovery_requestsは
--- 管理者キー復旧機能で追加。manager_subscriptionsは確定通知の拡張（店長向けプッシュ）で
--- 追加。テーブル定義自体はいずれも本ファイル前半、対応する既存テーブルの直後にある。
--- 中-2是正の教訓どおり、revoke対象のテーブルは必ずこのrevoke文より前で定義すること）。
+-- 管理者キー復旧機能で追加。テーブル定義は本ファイル前半、対応する既存テーブルの
+-- 直後にある。中-2是正の教訓どおり、revoke対象のテーブルは必ずこのrevoke文より
+-- 前で定義すること）。
 revoke all on table stores, pending_signups, supervisor_keys, subscriptions,
-                    manager_subscriptions, shifts, app_config, stripe_events,
+                    shifts, app_config, stripe_events,
                     used_emails, reports, key_recovery_requests
   from anon, authenticated;
 -- 将来追加されるテーブルにも、既定でanon/authenticatedへ権限が付与されないようにする

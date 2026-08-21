@@ -32,6 +32,20 @@
   .consentNote a { color: #00a8ff; }
   .siteFooter { max-width: 460px; margin: 16px auto 10px; padding: 14px 0; text-align: center; font-size: 12px; color: #999; }
   .siteFooter a { color: #888; text-decoration: underline; }
+  /* 代理出勤の確定通知の案内（登録完了時）。
+     【重要】画面全体を覆う一般的なモーダルにはしない。この画面には
+     「二度と表示されない管理者キー」が表示されており、それを隠してしまうと、
+     案内を読ませようとしてキーの保存を妨げるという本末転倒になるため、
+     画面下部に固定表示するバナー形式にして、キーの表示部分（画面上部）に
+     決してかぶらないようにしている。 */
+  .filledMailToast { display: none; position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; background: #ffffff; border-top: 2px solid #00a8ff; box-shadow: 0 -4px 16px rgba(0,0,0,0.12); padding: 16px 18px calc(16px + env(safe-area-inset-bottom)); text-align: left; }
+  .filledMailToastInner { max-width: 460px; margin: 0 auto; }
+  .filledMailToast h3 { margin: 0 0 6px; font-size: 15px; color: #1a4a6b; }
+  .filledMailToast p { margin: 0; font-size: 13px; color: #555; line-height: 1.7; }
+  .filledMailToast .toastAddress { font-family: monospace; font-weight: bold; color: #1a4a6b; word-break: break-all; }
+  .filledMailToast button { margin-top: 12px; padding: 12px; font-size: 15px; }
+  .filledMailNotice { background: #eef5fa; border: 1px solid #bcd7e8; border-radius: 8px; padding: 14px; margin-top: 16px; font-size: 13px; text-align: left; line-height: 1.7; color: #1a4a6b; }
+  .filledMailNotice .noticeAddress { font-family: monospace; font-weight: bold; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -78,6 +92,15 @@
       </div>
     </div>
 
+    <!-- 下部バナー(filledMailToast)を閉じた後も残る常設の案内。
+         バナーだけだと、すぐ閉じた場合に情報が消えてしまうため両方置く。 -->
+    <div class="filledMailNotice">
+      📧 <strong>代理出勤の確定通知は、ご登録のメールアドレス宛にお送りします。</strong><br>
+      <span class="noticeAddress" id="filledMailNoticeAddress"></span><br>
+      代打が決まると、その場でお知らせが届きます。アプリを開いて確認する必要はありません。<br>
+      ※ 迷惑メールフォルダに入っていないか、はじめの1回だけご確認ください。
+    </div>
+
     <div class="section">
       <label>店長用ダッシュボードのURL</label>
       <div class="linkbox">
@@ -94,6 +117,19 @@
       </div>
       <div id="qrcode"></div>
     </div>
+  </div>
+</div>
+
+<!-- 登録完了時に画面下部から出る案内バナー（「OK」で消える）。
+     画面上部の管理者キーには重ならない位置に固定している。 -->
+<div class="filledMailToast" id="filledMailToast" role="dialog" aria-live="polite" aria-labelledby="filledMailToastTitle">
+  <div class="filledMailToastInner">
+    <h3 id="filledMailToastTitle">📧 代理出勤の確定通知について</h3>
+    <p>
+      代打が決まると、<strong>ご登録のメールアドレス宛にお知らせ</strong>が届きます。<br>
+      <span class="toastAddress" id="filledMailToastAddress"></span>
+    </p>
+    <button type="button" onclick="dismissFilledMailToast()">OK</button>
   </div>
 </div>
 
@@ -241,6 +277,12 @@ async function verifyCode() {
     document.getElementById('codeArea').style.display = 'none';
     document.getElementById('resultArea').style.display = 'block';
 
+    // 確定通知の宛先の案内。textContentで入れる（pendingEmailは利用者の入力値のため、
+    // innerHTMLに入れるとHTMLとして解釈されうる）。
+    document.getElementById('filledMailNoticeAddress').textContent = pendingEmail;
+    document.getElementById('filledMailToastAddress').textContent = pendingEmail;
+    document.getElementById('filledMailToast').style.display = 'block';
+
     new QRCode(document.getElementById('qrcode'), {
       text: staffUrl,
       width: 200,
@@ -250,6 +292,10 @@ async function verifyCode() {
     statusEl.textContent = '❌ ' + err.message;
     btn.disabled = false;
   }
+}
+
+function dismissFilledMailToast() {
+  document.getElementById('filledMailToast').style.display = 'none';
 }
 
 function copyField(id) {
