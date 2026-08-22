@@ -398,6 +398,9 @@ async function sendSignupCodeEmail(email, code) {
       from: RESEND_FROM_EMAIL,
       to: email,
       subject: 'DAIDA+ 店舗登録の確認コード',
+      // プレーンテキスト版。HTMLだけのメールより業務連絡として扱われやすくなる
+      // （詳細はsendShiftFilledNotificationEmailのコメント参照）。
+      text: `DAIDA+の店舗登録ありがとうございます。\n\n確認コード: ${code}\n\nこのコードを登録画面に入力してください（${SIGNUP_CODE_TTL_MINUTES}分間有効です）。\n心当たりがない場合は、このメールは破棄してください。`,
       html: `
         <p>DAIDA+の店舗登録ありがとうございます。</p>
         <p>以下の確認コードを登録画面に入力してください（${SIGNUP_CODE_TTL_MINUTES}分間有効です）。</p>
@@ -428,6 +431,7 @@ async function sendKeyRecoveryCodeEmail(email, code, storeName) {
       from: RESEND_FROM_EMAIL,
       to: email,
       subject: 'DAIDA+ 管理者キーの再発行 確認コード',
+      text: `「${storeName}」の管理者キー再発行のご依頼を受け付けました。\n\n確認コード: ${code}\n\nこのコードを画面に入力してください（${KEY_RECOVERY_CODE_TTL_MINUTES}分間有効です）。\nこのコードを入力すると、現在の管理者キーは無効になり、新しい管理者キーが発行されます。時間帯責任者キーはそのまま引き続きお使いいただけます。\n\nこの操作に心当たりがない場合は、このメールを破棄してください。何もしなければ管理者キーは変更されません。`,
       html: `
         <p>「${escapeHtml(storeName)}」の管理者キー再発行のご依頼を受け付けました。</p>
         <p>以下の確認コードを画面に入力してください（${KEY_RECOVERY_CODE_TTL_MINUTES}分間有効です）。</p>
@@ -472,6 +476,7 @@ async function sendSupervisorEmailCodeEmail(email, code, storeName) {
       from: RESEND_FROM_EMAIL,
       to: email,
       subject: 'DAIDA+ 代理出勤の確定通知 確認コード',
+      text: `「${storeName}」の時間帯責任者として、代理出勤の確定通知の宛先にこのメールアドレスを登録するご依頼を受け付けました。\n\n確認コード: ${code}\n\nこのコードを画面に入力してください（${SUPERVISOR_EMAIL_CODE_TTL_MINUTES}分間有効です）。\n登録が完了すると、ご自身が送った代理募集に代打が決まったときに、このアドレス宛にお知らせが届くようになります。\n\nこの操作に心当たりがない場合は、このメールを破棄してください。何もしなければ登録されず、このアドレスに通知が届くこともありません。`,
       html: `
         <p>「${escapeHtml(storeName)}」の時間帯責任者として、代理出勤の確定通知の宛先にこのメールアドレスを登録するご依頼を受け付けました。</p>
         <p>以下の確認コードを画面に入力してください（${SUPERVISOR_EMAIL_CODE_TTL_MINUTES}分間有効です）。</p>
@@ -504,17 +509,30 @@ async function sendReportNotificationEmail({ receivedAt, target, content, report
     body: JSON.stringify({
       from: RESEND_FROM_EMAIL,
       to: REPORT_NOTIFICATION_EMAIL,
-      subject: '【DAIDA+】通報を受け付けました',
+      // 【Gmailのプロモーションタブ対策】確定通知メールと同じ理由で、件名の 【】 と
+      // 本文の箇条書きをやめ、プレーンテキスト版も送る（詳細は
+      // sendShiftFilledNotificationEmail のコメントを参照）。
+      // 通報は利用規約 第13条2項の「合理的な調査」の起点であり、運営が気づけないと
+      // 調査そのものが始まらない。見落としの原因は先に潰しておく。
+      subject: `DAIDA+ 通報を受け付けました（${receivedAt}）`,
+      text: [
+        'DAIDA+に新しい通報が届きました。内容をご確認のうえ、必要な調査をお願いします（利用規約 第13条2項）。',
+        '',
+        `受信日時: ${receivedAt}`,
+        `通報対象: ${target}`,
+        `通報内容: ${content}`,
+        `通報者（自己申告・任意）: ${reporter || '（未入力）'}`,
+        `店舗ID: ${storeId || '（未指定/該当する店舗なし）'}`,
+        `送信元IP: ${sourceIp}`,
+      ].join('\n'),
       html: `
         <p>DAIDA+に新しい通報が届きました。内容をご確認のうえ、必要な調査をお願いします（利用規約 第13条2項）。</p>
-        <ul>
-          <li>受信日時: ${escapeHtml(receivedAt)}</li>
-          <li>通報対象: ${escapeHtml(target)}</li>
-          <li>通報内容: ${escapeHtml(content)}</li>
-          <li>通報者（自己申告・任意）: ${escapeHtml(reporter || '（未入力）')}</li>
-          <li>店舗ID: ${escapeHtml(storeId || '（未指定/該当する店舗なし）')}</li>
-          <li>送信元IP: ${escapeHtml(sourceIp)}</li>
-        </ul>
+        <p>受信日時: ${escapeHtml(receivedAt)}<br>
+        通報対象: ${escapeHtml(target)}<br>
+        通報内容: ${escapeHtml(content)}<br>
+        通報者（自己申告・任意）: ${escapeHtml(reporter || '（未入力）')}<br>
+        店舗ID: ${escapeHtml(storeId || '（未指定/該当する店舗なし）')}<br>
+        送信元IP: ${escapeHtml(sourceIp)}</p>
       `,
     }),
   });
@@ -536,7 +554,42 @@ async function sendReportNotificationEmail({ receivedAt, target, content, report
 // 崩れないようにする）。
 // 件名だけでも「決まったこと」と「いつのシフトか」が分かるようにする。店長はスマホの
 // 通知画面でこれを見ることが多く、本文を開かなくても急ぎの用件だと判断できる必要があるため。
+//
+// 【Gmailのプロモーションタブ対策・実測に基づく修正】
+// 実機検証で、同じ送信元(send.daida-store.jp)から送っているのに
+//   ・確認コードのメール → 「メイン」タブ
+//   ・確定通知のメール   → 「プロモーション」タブ
+// と振り分けが分かれた。2通の違いは次の2点だけだった。
+//   ① 件名の先頭に 【】 が付いていた
+//   ② 本文が <ul><li> の箇条書きだった
+// 日本語圏では 【】 付きの件名と箇条書きの本文がメルマガ・販促メールの典型であり、
+// Gmailの分類器はこれを手がかりのひとつにしていると考えられる。
+// 確定通知は「すぐ気づいてほしい業務連絡」であり、プロモーションタブに入ると
+// 店長が見るのが何時間も後になり、この機能の価値そのものが失われる。そのため
+//   ・件名から 【】 を外す
+//   ・箇条書きをやめて文章にする
+//   ・プレーンテキスト版(text)も同時に送る（HTMLのみより業務連絡らしく扱われやすい）
+// の3点を行う。
+//
+// 【重要・過信しないこと】これで確実にメインタブに入る保証はない。Gmailの判定基準は
+// 公開されておらず、送信ドメインの実績や受信者ごとの操作履歴にも左右される。
+// そのため、店長向けの案内に「最初の1通はプロモーションタブも確認し、
+// メインタブに移動してください」と明記する運用側の対策と必ずセットで行う。
 async function sendShiftFilledNotificationEmail({ storeEmail, storeName, filledBy, date, time, note }) {
+  const subject = `代打が決まりました（${storeName} ${date} ${time}）`;
+  // プレーンテキスト版。HTMLタグを含まないため、エスケープは不要かつ有害
+  // （&amp; のような実体参照がそのまま文字として見えてしまう）。
+  const text = [
+    `「${storeName}」の代打募集に応募があり、確定しました。`,
+    '',
+    `${date} ${time} の代打は ${filledBy} さんに決まりました。`,
+    note ? `補足: ${note}` : '',
+    '',
+    'このメールはDAIDA+から自動送信しています。',
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -546,15 +599,13 @@ async function sendShiftFilledNotificationEmail({ storeEmail, storeName, filledB
     body: JSON.stringify({
       from: RESEND_FROM_EMAIL,
       to: storeEmail,
-      subject: `【DAIDA+】代打が決まりました（${date} ${time}）`,
+      subject,
+      text,
       html: `
         <p>「${escapeHtml(storeName)}」の代打募集に応募があり、確定しました。</p>
-        <ul>
-          <li>応募したスタッフ: ${escapeHtml(filledBy)}</li>
-          <li>日付: ${escapeHtml(date)}</li>
-          <li>時間: ${escapeHtml(time)}</li>
-          ${note ? `<li>補足: ${escapeHtml(note)}</li>` : ''}
-        </ul>
+        <p><strong>${escapeHtml(date)} ${escapeHtml(time)}</strong> の代打は <strong>${escapeHtml(filledBy)}</strong> さんに決まりました。</p>
+        ${note ? `<p>補足: ${escapeHtml(note)}</p>` : ''}
+        <p>このメールはDAIDA+から自動送信しています。</p>
       `,
     }),
   });
